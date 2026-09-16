@@ -35,7 +35,26 @@ jobs:
           ECOM_AGENT_CHROME_PATH: ""
           # 双保险：即使有人误加了 key，这个开关不打开就不会真的联网。
           ECOM_AGENT_ENABLE_LIVE_LLM: "false"
-        run: python -m pytest -v -m "not needs_browser"
+        run: |
+          set +e
+          python -m pytest -v -m "not needs_browser" --tb=short 2>&1 | tee /tmp/pytest_offline.log
+          code=${PIPESTATUS[0]}
+          set -e
+
+          # ★ 把失败原因抬成【注解】，这是本仓库唯一不需要权限就能读到的通道。
+          #   实测过：日志接口要 admin 权限（公开仓库也一样），job summary 不进公开 HTML，
+          #   公开 run 页面只给 job 名和状态。所以一次红的门禁，
+          #   对任何没登录的人（以及把链接发给面试官之后的面试官）来说只有一句
+          #   "exit code 1" —— 而"红的原因不可读"正是让人开始忽略 CI 的第一步。
+          #   这一条和上面 browser job 的注释是同一个道理，只是发生在 CI 自身这一层。
+          #
+          #   ★ 为什么可以把输出贴到公开页面：CI 里 DEEPSEEK_API_KEY 是 ci-dummy，
+          #     真凭据从不进 CI（见上面 env）。这是 R4 的纪律，也是这一步能成立的前提。
+          if [ "$code" -ne 0 ]; then
+            MSG=$(tail -n 60 /tmp/pytest_offline.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error::离线测试失败（硬门禁）。最后 60 行：${MSG}"
+          fi
+          exit "$code"
 
   # ── 浏览器门禁：尽力跑，失败不阻塞 ──────────────────────────────
   #
@@ -73,6 +92,27 @@ jobs:
           sudo apt-get install -y -qq libnss3 libatk-bridge2.0-0 libgtk-3-0 \
             libgbm1 libasound2t64 fonts-noto-cjk || true
 
+      # ★ 先把"环境坏了"和"代码坏了"分开，再跑测试。
+      #   没有这一步的话，两种失败在下游长得一模一样：都是 pytest 红一片，
+      #   而排查方向完全相反 —— 一个要去改 runner，一个要去改代码。
+      #   探测结果用 ::notice:: / ::warning:: 抬成注解，这样它和失败原因一样是公开可读的。
+      - name: 探测浏览器（把"环境坏了"和"代码坏了"分开）
+        run: |
+          echo "平台: $(uname -a)"
+          python -c "
+          import platform, subprocess
+          from browser_use.browser.chrome import find_chrome_executable as find_chrome
+          p = find_chrome()
+          print('python:', platform.python_version())
+          print('find_chrome_executable() ->', p)
+          if p:
+              v = subprocess.run([p, '--version'], capture_output=True, text=True)
+              print('版本:', (v.stdout or v.stderr).strip())
+              print('::notice::browser-use 探测到的 Chrome: ' + p)
+          else:
+              print('::warning::find_chrome_executable() 返回 None —— 下游浏览器测试的红是【环境问题】，不是代码问题')
+          "
+
       - name: 跑浏览器测试
         env:
           DEEPSEEK_API_KEY: ci-dummy
@@ -82,9 +122,21 @@ jobs:
           ECOM_AGENT_HEADLESS: "true"
         run: |
           set +e
-          python -m pytest -v -m "needs_browser"
-          code=$?
+          python -m pytest -v -m "needs_browser" --tb=short 2>&1 | tee /tmp/pytest_browser.log
+          code=${PIPESTATUS[0]}
           set -e
+
+          # ★ 失败原因抬成注解 —— 理由同 offline job 那一段。
+          #   顺带一个真实的、找了我半天的教训：这个 job 第一次在 CI 上红的时候，
+          #   公开 run 页面上只有 "Process completed with exit code 1"，
+          #   日志接口回 403 "Must have admin rights to Repository"，
+          #   job summary 压根不进公开 HTML。也就是说这份 workflow 当时
+          #   把一个它自己都无法解释的失败推给了所有看客。
+          #   可观测性不是"日志写得详细"，是【看的人拿得到】。
+          if [ "$code" -ne 0 ] && [ "$code" -ne 5 ]; then
+            MSG=$(tail -n 80 /tmp/pytest_browser.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error::needs_browser 测试失败（退出码 ${code}）。最后 80 行：${MSG}"
+          fi
 
           # ★ 必须显式区分退出码 5（未收集到任何用例）和 1（用例真的失败了）。
           #
@@ -106,4 +158,8 @@ jobs:
             echo ""
             echo "本 job 是 \`continue-on-error: true\`，红不代表代码坏了。"
             echo "本地必须过：\`pytest -m needs_browser\`"
+            echo ""
+            echo "★ 失败原因在【本页的 Annotations 面板】里，不在日志里 ——"
+            echo "日志接口要 admin 权限（公开仓库也一样），job summary 不进公开 HTML，"
+            echo "注解是这个仓库唯一公开可读的失败通道。"
           } >> "$GITHUB_STEP_SUMMARY"
