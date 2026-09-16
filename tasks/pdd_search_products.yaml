@@ -1,0 +1,150 @@
+# 拼多多商家后台 —— 商品列表采集（只读）
+#
+# ★ 这个文件是 git 一等公民：它会被 code review，会被 diff，会进版本历史。
+#   这正是"任务 DSL"相对"每次现写一段 prompt"的第一个收益 ——
+#   提示词改了什么、谁改的、为什么改，全都可追溯。
+
+schema_version: "1"
+id: pdd.search_products
+name: 拼多多商家后台 - 商品搜索与字段提取
+site: pinduoduo
+
+# ★ requires_login 会往任务文本里插一段"遇登录页立即停止"的指令。
+#   我们用持久 profile（人工扫码一次），所以 agent 永远不该看到登录表单；
+#   万一看到了，说明 profile 失效 —— 那时正确的行为是停下来叫人，不是尝试登录。
+requires_login: true
+start_url: "https://mms.pinduoduo.com/goods/goods_list"
+
+goal: >-
+  在商品管理中按关键词「{keyword}」搜索，只保留状态「{status}」的商品，
+  最多提取 {limit} 条，每条读取商品ID、标题、价格、库存、状态五个字段。
+
+# ★ 步骤显式、有序、可 review —— 这是相对"一段自然语言 prompt"的核心差别。
+#   注意每条指令都带了【失败时怎么办】，因为裸指令遇到意外时 LLM 会自由发挥，
+#   而自由发挥在卖家后台是真会改数据的。
+steps:
+  - "确认在商品管理页。若出现登录页或扫码页，立刻停止并调用 done 汇报'需要人工登录'，不要尝试输入账号密码。"
+  - "在搜索框输入「{keyword}」，点击搜索或按回车。"
+  - "若存在状态筛选器，选择「{status}」并确定；若不存在，跳过，不要报错也不要反复重试。"
+  - "读取当前页表格，逐行提取五个字段。只读，不要点击任何'编辑''删除''下架''批量操作'按钮。"
+  - "若已收集满 {limit} 条，立即调用 done 返回；否则按分页设置继续。"
+  - "整个过程中不要修改任何商品数据。你的任务是只读采集。"
+
+params:
+  keyword:
+    type: string
+    required: true
+    description: "商品搜索关键词"
+  status:
+    type: enum
+    enum: ["在售中", "已下架", "全部"]
+    default: "在售中"
+    description: "只看这个状态的商品"
+  limit:
+    type: integer
+    default: 20
+    ge: 1
+    le: 200          # ★ 上限防"翻页地狱"：LLM 在采集类任务上极容易一直翻下去
+    description: "最多提取多少条"
+
+output_model: pdd.ProductRowList
+output_model_version: 1
+
+pagination:
+  mode: click_next
+  max_pages: 3
+  # ★ 语义提示，不是 CSS 选择器。
+  #   真实站点的 class 名是构建产物 hash，发一次版就全变；
+  #   而"分页条最右侧的下一页"这个描述不会变。
+  #   这正是选 browser-use（读无障碍树）而不是 Playwright 手写选择器的核心理由。
+  next_selector_hint: "分页条最右侧的'下一页'；按钮变灰不可点时表示已到底"
+  stop_when: "'下一页'变为禁用，或已收集满 {limit} 条"
+
+retry:
+  max_attempts: 2
+  step_max_failures: 3
+  on_empty_result: retry
+
+observability:
+  screenshot: true
+  record_llm_io: true
+  # ★ 自动脱敏（cookie/手机号/邮箱/长数字）之外，还要额外盖掉的字面值。
+  #   店铺名本身不是敏感信息，但公开演示的截图和日志里没必要出现。
+  redact_extra: ["我的测试小店"]
+
+# ── 护栏 ────────────────────────────────────────────────
+guardrails:
+  allowed_domains:
+    - "mms.pinduoduo.com"
+    - "*.pinduoduo.com"
+  prohibited_domains:
+    - "*.taobao.com"
+    - "*.jd.com"
+    - "*.alibaba.com"
+
+  # ★ 默认 confirm，不是 allow。
+  #   LLM 的失败模式恰恰是【做了你没预料到的那个动作】——
+  #   而"没写规则的地方"正是它最可能乱来的地方。
+  default_decision: confirm
+
+  approval_timeout_s: 300
+  max_consecutive_blocks: 3
+
+  rules:
+    # ── 一票否决：会改店铺真实数据 ──
+    - id: block-destructive
+      decision: block
+      reason: "破坏性/不可逆操作，会改店铺真实数据"
+      match_action: [click, input, send_keys]
+      match_element_text: "删除|批量删除|下架|清空|重置|退出登录|解绑|注销"
+
+    # ── 一票否决：账号与会话 ──
+    #   ★ 用 match_param_regex 而不是 match_element_text：账号相关的动作
+    #     常常是直接导航到某个 URL，页面上根本没有可读文本。
+    - id: block-account
+      decision: block
+      reason: "账号/会话相关，agent 不应触碰"
+      match_action: [navigate, click]
+      match_param_regex: "logout|signout|unbind|password|setting"
+
+    # ── 人工二次确认：钱 ──
+    - id: confirm-money
+      decision: confirm
+      reason: "资金相关，必须人工二次确认"
+      match_action: [click]
+      match_element_text: "提交订单|立即支付|确认付款|打款|提现|开通|购买|续费|充值"
+
+    # ── 人工二次确认：会真实创建/上线 ──
+    - id: confirm-publish
+      decision: confirm
+      reason: "会真实创建或上线商品"
+      match_action: [click]
+      match_element_text: "发布商品|保存并上架|提交审核|确认提交"
+
+    # ── 人工二次确认：写入类操作 ──
+    #   本任务本应只读，这条是"误触"的兜底 —— 如果 LLM 点到了编辑，先停下来问。
+    - id: confirm-edit
+      decision: confirm
+      reason: "写入类操作；本任务本应只读，确认是否误触"
+      match_action: [click]
+      match_element_text: "编辑|修改|保存"
+
+    # ── 显式放行：只读检索 ──
+    #   ★ 这条不是必需的（没它也会落到 default_decision），但它有独立价值：
+    #     它把"哪些是明确允许的"写成了可审计的记录。
+    #     没有 allow 规则时，事后无法区分"这个动作是被明确允许的"还是
+    #     "当时没人想到要管它"。
+    - id: allow-readonly
+      decision: allow
+      reason: "只读检索类操作"
+      match_action: [input, click, scroll, extract, extract_table, go_back]
+      match_url: "*mms.pinduoduo.com*"
+      match_element_text: "搜索|查询|筛选|确定|取消|下一页|上一页|关闭"
+
+agent:
+  # ★ use_vision 必须为 False：DeepSeek 文本模型没有视觉能力。
+  #   AgentSpec 里有 validator 会拒绝 True —— 想开就得先换模型并改 ADR-2。
+  use_vision: false
+  max_actions_per_step: 2
+  max_steps: 60
+  max_failures: 5

@@ -31,6 +31,14 @@ RUNS_DIR = PROJECT_ROOT / "runs"
 TASKS_DIR = PROJECT_ROOT / "tasks"
 DB_PATH = RUNS_DIR / "ecom_agent.db"
 
+# ★ 审批通道的文件约定目录。WebApprover 与 FileApprover 共用同一套：
+#   pending/ 里有一份 = 有人正在等回答。进程重启后 pending/ 非空，
+#   说明上一个 run 是在等审批时死掉的 —— 这个残留本身就是有用的诊断信号，
+#   所以刻意不放在某个 run 的子目录里（那样它只会在该 run 被查看时才发现）。
+APPROVALS_DIR = RUNS_DIR / "approvals"
+PENDING_DIR = APPROVALS_DIR / "pending"
+DECIDED_DIR = APPROVALS_DIR / "decided"
+
 # ── 密钥 ──────────────────────────────────────────────────
 # 裸读不校验，交给调用方。测试与 CI 用假 key（见 .github/workflows/ci.yml）。
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")

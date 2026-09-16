@@ -1,0 +1,95 @@
+# books.toscrape.com —— 公开练手站点，只读采集
+#
+# ★ 这个模板存在两个理由：
+#   1. 它【不需要登录、不碰任何真实后台】，是新人 clone 下来就能跑通的第一个任务。
+#      一个"跑不起来"的项目，README 写得再好也没人看第二眼。
+#   2. 它是 Phase 3 e2e 的载体：验证"YAML → 浏览器 → 结构化 → 落库 → 报告"
+#      整条链路，而不引入登录态和风控这两个不可控变量。
+#
+#   它刻意与 pdd_search_products 共用同一套护栏机制（只是白名单不同），
+#   所以跑通它也顺带证明了护栏在无头 CI 环境里不会误伤正常操作。
+
+schema_version: "1"
+id: demo.books
+name: 公开练手站点 - 书籍标题与价格采集
+site: demo
+
+requires_login: false
+start_url: "https://books.toscrape.com/"
+
+goal: >-
+  采集书籍列表页的商品，最多 {limit} 条，每条读取标题、价格、库存状态三个字段。
+
+steps:
+  - "打开页面，读取书籍列表。"
+  - "逐本读取书名、价格、库存状态（In stock / Out of stock）。"
+  - "只读，不要点击任何链接进入详情页。"
+  - "收集满 {limit} 条后立即调用 done 返回。"
+
+params:
+  limit:
+    type: integer
+    default: 5
+    ge: 1
+    le: 40
+    description: "最多提取多少条"
+
+# ★ 注意这里复用的是拼多多的输出模型。
+#   这是【刻意】的过渡状态：books 是练手站点，为它单独建一套模型没有价值。
+#   但字段语义并不完全贴合（books 没有 goods_id 和 stock 件数），
+#   所以这个模板的真实用途是"验证链路"，不是"产出可用的业务数据"。
+#   真要做书籍采集，应该新建 demo.BookRowList 并按版本号注册 —— 见 registry.py 的说明。
+output_model: pdd.ProductRowList
+output_model_version: 1
+
+pagination:
+  mode: click_next
+  max_pages: 2
+  next_selector_hint: "页面底部右侧的 'next' 链接；没有这个链接表示已到最后一页"
+  stop_when: "找不到 'next' 链接，或已收集满 {limit} 条"
+
+retry:
+  max_attempts: 2
+  step_max_failures: 3
+  on_empty_result: accept
+
+observability:
+  screenshot: true
+  record_llm_io: true
+  redact_extra: []
+
+guardrails:
+  allowed_domains:
+    - "books.toscrape.com"
+  # ★ 练手站点的禁止列表留空是【安全】的，因为白名单非空 ——
+  #   check_navigation 的语义是"配了白名单但没命中就一律拦"，
+  #   所以任何站外导航都会被挡住，不依赖 prohibited 列表。
+  prohibited_domains: []
+
+  # ★ 即使是练手站点，默认决策也保持 confirm。
+  #   如果这里为了"跑得顺"改成 allow，那 CI 就跑在一个与生产不同的策略上 ——
+  #   测出来的绿不能代表什么。宁可在 CI 里多几次审批被自动拒绝，
+  #   也要让被测试的策略和真实策略是同一个。
+  default_decision: confirm
+
+  max_consecutive_blocks: 3
+
+  rules:
+    - id: allow-readonly
+      decision: allow
+      reason: "只读检索类操作"
+      match_action: [input, click, scroll, extract, extract_table, go_back]
+      match_url: "*books.toscrape.com*"
+      match_element_text: "next|Next"
+
+    - id: block-destructive
+      decision: block
+      reason: "练手站点上没有需要写操作的场景，任何删除类动作都是误触"
+      match_action: [click]
+      match_element_text: "删除|delete|remove"
+
+agent:
+  use_vision: false
+  max_actions_per_step: 2
+  max_steps: 30
+  max_failures: 5

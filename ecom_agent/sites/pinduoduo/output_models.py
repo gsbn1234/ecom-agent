@@ -15,6 +15,8 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ecom_agent.dsl.registry import register_output_model
+
 
 class ParseStatus(str, Enum):
     """一次采集的结果状态。对应 runs 表的 parse_status 列。"""
@@ -103,6 +105,7 @@ class ProductRow(BaseModel):
         return flags
 
 
+@register_output_model("pdd.ProductRowList", version=1)
 class ProductRowList(BaseModel):
     """一次采集的完整输出。这是 Agent 的 output_model_schema。"""
 
