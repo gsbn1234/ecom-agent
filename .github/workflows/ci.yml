@@ -80,7 +80,23 @@ jobs:
           # 空串 → browser-use 的 find_chrome_executable() 去找 runner 上已装的 Chrome
           ECOM_AGENT_CHROME_PATH: ""
           ECOM_AGENT_HEADLESS: "true"
-        run: python -m pytest -v -m "needs_browser"
+        run: |
+          set +e
+          python -m pytest -v -m "needs_browser"
+          code=$?
+          set -e
+
+          # ★ 必须显式区分退出码 5（未收集到任何用例）和 1（用例真的失败了）。
+          #
+          #   踩过的坑：Phase 0 时仓库里还没有任何 needs_browser 用例，pytest 退出码 5
+          #   让这个 job 变红 —— 看起来和"Chromium 装不上"一模一样，
+          #   但根因完全不同（一个是不该修，一个是环境问题）。
+          #   在 CI 上，"红的原因不可分辨"比"红"本身更有害：它会训练人忽略这个 job。
+          if [ "$code" -eq 5 ]; then
+            echo "::notice::还没有 needs_browser 用例（Phase 2 的 spike 会补上）。退出码 5 = 未收集到用例，不算失败。"
+            exit 0
+          fi
+          exit "$code"
 
       - name: 把结论写进 job summary（即使失败也执行）
         if: always()
