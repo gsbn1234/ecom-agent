@@ -37,7 +37,15 @@ jobs:
           ECOM_AGENT_ENABLE_LIVE_LLM: "false"
         run: |
           set +e
-          python -m pytest -v -m "not needs_browser" --tb=short 2>&1 | tee /tmp/pytest_offline.log
+          # ★ --tb=long + -rf，两个都是为了让【我们自己写的断言消息】活着到达注解：
+          #   · 这个项目的断言消息是精心写的诊断文本（往往是好几行的中文），
+          #     它们才是真正的失败原因。--tb=short 会把 raise 语句的源码上下文压成
+          #     "...<4 lines>..."，而 pytest 默认又不在结尾列失败清单 ——
+          #     结果是多个用例同时失败时，tail 只捞得到最后一个的栈。
+          #   · -rf 在输出【最末尾】补一份一行一条的失败清单，而注解取的正是 tail ——
+          #     于是"有几个挂了、各挂在哪一句"必定落在窗口里。
+          #   · 消息在末尾，tail 从末尾取，所以 --tb=long 撑长 traceback 也不会把它挤掉。
+          python -m pytest -v -m "not needs_browser" --tb=long -rf 2>&1 | tee /tmp/pytest_offline.log
           code=${PIPESTATUS[0]}
           set -e
 
@@ -95,23 +103,20 @@ jobs:
       # ★ 先把"环境坏了"和"代码坏了"分开，再跑测试。
       #   没有这一步的话，两种失败在下游长得一模一样：都是 pytest 红一片，
       #   而排查方向完全相反 —— 一个要去改 runner，一个要去改代码。
-      #   探测结果用 ::notice:: / ::warning:: 抬成注解，这样它和失败原因一样是公开可读的。
+      #   探测结果用 ::notice:: / ::warning:: / ::error:: 抬成注解，这样它和失败原因一样是公开可读的。
+      #
+      # ★ 为什么探的是 devtools/probe_browser.py 而不是几行 inline python：
+      #   第一版探针只回答了"Chrome 在不在"（答案：在），然后测试照样红，
+      #   注解只给到一句 local_browser_watchdog.py:428 的 RuntimeError。
+      #   去读库源码才知道为什么补 traceback 没用：
+      #     · 那个 RuntimeError 的消息是【硬编码】的通用提示（"可能要 --no-sandbox"），
+      #       把 --tb=short 改成 --tb=long 只是把一句我已经读过源码的话打全；
+      #     · Chrome 是用 stderr=PIPE 起的（local_browser_watchdog.py:150），
+      #       而全库【没有任何一行读这个管道】—— 死因被接了管道却没人听。
+      #   所以探针改成"按同样的二进制、同样的 get_args() 自己起一次，自己读 stderr"。
+      #   这份脚本本地也能跑，且用的是和测试同一条 Chrome 解析顺序（config.CHROME_PATH）。
       - name: 探测浏览器（把"环境坏了"和"代码坏了"分开）
-        run: |
-          echo "平台: $(uname -a)"
-          python -c "
-          import platform, subprocess
-          from browser_use.browser.chrome import find_chrome_executable as find_chrome
-          p = find_chrome()
-          print('python:', platform.python_version())
-          print('find_chrome_executable() ->', p)
-          if p:
-              v = subprocess.run([p, '--version'], capture_output=True, text=True)
-              print('版本:', (v.stdout or v.stderr).strip())
-              print('::notice::browser-use 探测到的 Chrome: ' + p)
-          else:
-              print('::warning::find_chrome_executable() 返回 None —— 下游浏览器测试的红是【环境问题】，不是代码问题')
-          "
+        run: python devtools/probe_browser.py
 
       - name: 跑浏览器测试
         env:
@@ -122,7 +127,10 @@ jobs:
           ECOM_AGENT_HEADLESS: "true"
         run: |
           set +e
-          python -m pytest -v -m "needs_browser" --tb=short 2>&1 | tee /tmp/pytest_browser.log
+          # ★ 与 offline job 同款参数，理由见那边（--tb=long + -rf 是为了让
+          #   自己写的断言消息活着到达注解；pytest 的 "--tb=short 截断"
+          #   是这一轮排查里真实踩到的、我自己给自己挖的坑）。
+          python -m pytest -v -m "needs_browser" --tb=long -rf 2>&1 | tee /tmp/pytest_browser.log
           code=${PIPESTATUS[0]}
           set -e
 
