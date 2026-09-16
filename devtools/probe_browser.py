@@ -116,8 +116,10 @@ def _missing_libs(path: str) -> list[str]:
 
 
 # ── 第一段：我按库的参数起一次（证伪"环境问题"）────────────
-async def _try_launch(browser_path: str, args: list[str], port: int) -> tuple[str, str, int | None]:
-    """按库的参数起一次 Chrome，读它的 stderr。
+async def _try_launch(
+    browser_path: str, args: list[str], port: int, timeout: float = CDP_TIMEOUT_S
+) -> tuple[str, str, int | None]:
+    """按给定参数起一次 Chrome，读它的 stderr。
 
     返回 (结论, stderr, 退出码)。结论 ∈ {"cdp_ok", "exited", "timeout"}。
     """
@@ -130,10 +132,10 @@ async def _try_launch(browser_path: str, args: list[str], port: int) -> tuple[st
     )
     print(f"  进程 PID = {proc.pid}")
 
-    deadline = asyncio.get_running_loop().time() + CDP_TIMEOUT_S
+    deadline = asyncio.get_running_loop().time() + timeout
     verdict = "timeout"
     while asyncio.get_running_loop().time() < deadline:
-        # 先判死再看 CDP：进程已经没了的话，再等只是白等满 15 秒。
+        # 先判死再看 CDP：进程已经没了的话，再等只是白等满超时。
         if proc.returncode is not None:
             verdict = "exited"
             break
@@ -158,6 +160,64 @@ async def _try_launch(browser_path: str, args: list[str], port: int) -> tuple[st
     except asyncio.TimeoutError:
         stderr = b""
     return verdict, stderr.decode("utf-8", "replace").strip(), proc.returncode
+
+
+def _fatal_lines(text: str) -> list[str]:
+    """从 Chrome 输出里挑出"为什么死"的那几行。
+
+    ★ 为什么不能用 tail：实测踩过一次 —— Chrome 崩溃时 stderr 的末尾几十行
+      全是栈帧（#0..#19 加一整排寄存器），真正的死因（那行 FATAL / Check failed）
+      在栈【前面】，正好被 tail 挤出去。
+      tail 对"人写的日志"好用，对"崩溃转储"恰恰相反：越靠后越没有信息量。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for ln in text.splitlines():
+        s = ln.strip()
+        interesting = any(k in s for k in ("FATAL", "Check failed", "Received signal"))
+        # crashpad 那几条 cpufreq 的 ERROR 是 runner 上必然出现的噪声，不是死因
+        if not interesting and "ERROR:" in s and "cpufreq" not in s:
+            interesting = True
+        if interesting and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+# ★ 关沙箱用的三个参数，抄自库自己的 CHROME_DOCKER_ARGS
+#   （browser/profile.py:130-132）。不自己发明，是为了让"探针验证过的组合"
+#   和"库在 chromium_sandbox=False 时真正会用的组合"是同一个东西 ——
+#   否则探针说"关沙箱就好了"，而库关沙箱时加的参数和探针不一样，白验。
+SANDBOX_OFF_ARGS = ["--no-sandbox", "--disable-gpu-sandbox", "--disable-setuid-sandbox"]
+
+
+async def _sandbox_matrix(
+    browser_path: str, lib_args: list[str]
+) -> dict[str, tuple[str, int | None, str]]:
+    """用【库真正挑中的那个二进制】，沙箱开/关各起一次。
+
+    ★ 为什么值得单独跑这个矩阵：
+      崩溃栈落在 content::ZygoteHostImpl::Init()，它同时兼容两个完全不同的假设 ——
+        A. 库挑的二进制和探针挑的不是同一个（两份不同的搜索清单，见
+           local_browser_watchdog.py:264-279 vs browser/chrome.py）→ 修法是钉死路径；
+        B. 二进制是同一个，是这个 runner 不让 Chrome 建 namespace 沙箱
+           （Ubuntu 24.04 起 kernel.apparmor_restrict_unprivileged_userns=1）
+           → 修法是 chromium_sandbox=False。
+      这两个假设指向【不同的修法】，而它们在同一个崩溃栈下长得一模一样。
+      与其猜，不如把两个变量一次跑完：结果直接决定改哪一行。
+    """
+    base = [a for a in lib_args[1:] if not a.startswith("--remote-debugging-port")]
+    out: dict[str, tuple[str, int | None, str]] = {}
+    for label, extra in (("沙箱开", []), ("沙箱关", SANDBOX_OFF_ARGS)):
+        port = _port()
+        verdict, err, code = await _try_launch(
+            browser_path, [*base, f"--remote-debugging-port={port}", *extra], port
+        )
+        print(f"\n  [{label}] 结论={verdict} 退出码={code}")
+        for ln in _fatal_lines(err)[:4]:
+            print(f"      {ln}")
+        out[label] = (verdict, code, err)
+    return out
 
 
 # ── 第二段：跑【库自己的】启动路径，但把它的管道偷换成文件 ────
@@ -338,20 +398,78 @@ def main() -> int:
         print("Chrome 输出: （空 —— 一个字都没写出来，说明它连初始化都没走完）")
     print("-" * 70)
 
-    # ── 4. 结论 ─────────────────────────────────────────
+    fatals = _fatal_lines(log_text)
+    if fatals:
+        print("死因行（从崩溃转储里挑出来的，不是 tail）:")
+        for ln in fatals[:6]:
+            print(f"  {ln}")
+        _ann("error", "Chrome 的死因行：" + " | ".join(fatals[:3]))
+
+    lib_binary = str((lib.get("argv") or ["(未知)"])[0])
+    if lib.get("argv"):
+        print(f"\n⚠️ 探针自己用的是 {browser_path}")
+        print(f"   库用的是        {lib_binary}")
+        _ann("notice", f"库真正挑中的二进制: {lib_binary}")
+        if lib_binary != str(browser_path):
+            _ann(
+                "warning",
+                f"两者不是同一个二进制！探针={browser_path} / 库={lib_binary}"
+                "（两处用的是不同的搜索清单：browser/chrome.py vs local_browser_watchdog.py:264-279）",
+            )
+
+    # ── 3b. 把"修法"也验掉：让库带着 chromium_sandbox=False 再起一次 ──
+    # ★ 为什么要在探针里预演修复，而不是"先出结论、下个 commit 再改、再等一轮 CI"：
+    #   那样拿到的是"我猜这个开关能修"，而这里拿到的是"这个开关在这个 runner 上
+    #   确实能起"。两者都是好证据，但后者不需要再花一轮 5 分钟去确认，
+    #   而且如果预演失败，我当场就知道假设错了 —— 不必等到改完代码才发现。
+    lib2: dict = {}
+    if lib.get("argv") and not lib.get("ok"):
+        print("\n" + "─" * 70)
+        print("第二段（对照）：同一份配置，但 chromium_sandbox=False")
+        print("─" * 70)
+        lib2 = asyncio.run(_library_launch({**session_kw, "chromium_sandbox": False}))
+        print(f"结果 : {'成功' if lib2.get('ok') else '失败'}")
+        print(f"异常 : {lib2.get('error') or '(无)'}")
+        if lib2.get("ok"):
+            _ann(
+                "error",
+                "对照结论：同一条库路径，chromium_sandbox=False 就起得来 → "
+                "修法已在本 runner 上验证，直接给 CI 加这个开关即可",
+            )
+        else:
+            _ann(
+                "error",
+                "对照结论：chromium_sandbox=False 也不行 → 关沙箱不是修法，别去改它。"
+                f"异常={lib2.get('error') or '?'}",
+            )
+
+    # ── 4. 沙箱矩阵：用库挑中的二进制，开/关各起一次 ──────
+    matrix: dict[str, tuple[str, int | None, str]] = {}
+    if lib.get("argv"):
+        print("\n" + "─" * 70)
+        print("第三段：沙箱矩阵（用库真正挑中的二进制，其余参数照抄库）")
+        print("─" * 70)
+        matrix = asyncio.run(_sandbox_matrix(lib_binary, lib["argv"]))
+        on_v, off_v = matrix["沙箱开"][0], matrix["沙箱关"][0]
+        print(f"\n沙箱开={on_v}  沙箱关={off_v}")
+        if off_v == "cdp_ok" and on_v != "cdp_ok":
+            _ann(
+                "error",
+                "矩阵结论：同一个二进制，沙箱关了就起得来、开着就崩 → 修法是 BrowserSession(chromium_sandbox=False)"
+                "（库的既有开关，profile.py:447，为 False 时自己会加上 --no-sandbox）",
+            )
+        elif on_v == "cdp_ok":
+            _ann("notice", "矩阵结论：沙箱开着也能起 → 崩溃与沙箱无关，是库那条路径特有的差别")
+        else:
+            _ann("error", f"矩阵结论：开/关都起不来（开={on_v} / 关={off_v}）→ 与沙箱无关，去看死因行")
+
+    # ── 5. 结论 ─────────────────────────────────────────
     if lib.get("ok"):
-        _ann(
-            "notice",
-            "第二段：库自己的启动路径也成功了 → 说明失败与启动方式无关，"
-            "去查测试里的那份配置（conftest/夹具和本探针的差别）",
-        )
+        _ann("notice", "第二段：库自己的启动路径也成功了 → 失败与启动方式无关，去查测试那份配置")
+    elif matrix:
+        _ann("error", f"第二段：库自己的启动失败（退出码 {lib.get('returncode')}，死因见 Chrome 死因行）")
     else:
-        tail = " | ".join(log_text.splitlines()[-5:]) if log_text else "(Chrome 一个字都没输出)"
-        _ann(
-            "error",
-            f"第二段：库自己的启动失败。异常={lib.get('error') or '?'}；"
-            f"退出码={lib.get('returncode')}；Chrome 输出末尾：{tail}",
-        )
+        _ann("error", f"第二段：库自己的启动失败。异常={lib.get('error') or '?'}")
     return 0
 
 
