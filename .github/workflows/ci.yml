@@ -216,22 +216,14 @@ jobs:
       #     不加的话，每次绿跑也会在公开页面上留一条 error 注解 ——
       #     而"注解区里总有红字"正是让人开始忽略注解的第一步，
       #     这个通道就自己把自己废掉了。
+      # ★ 这里只决定【什么时候】去看，不决定【怎么看】——
+      #   挑哪几行算死因的逻辑和探针共用一份（devtools/probe_browser.py 的
+      #   fatal_lines + --fatal-lines 模式）。
+      #   原先 workflow 里另写了一遍 grep，和探针那份思路相反（一个黑名单一个白名单），
+      #   结果就是"修好一份、另一份还是错的，而且没人会发现，因为两边都跑得动"。
       - name: 把 Chrome 自己的输出抬成注解（库接了管道，却从不读它）
         if: always() && steps.browser_tests.outcome == 'failure'
-        run: |
-          F=/tmp/chrome_capture.log
-          if [ -s "$F" ]; then
-            N=$(grep -c '>>> 第 ' "$F" || true)
-            # ★ 不用 tail。实测踩过：Chrome 崩溃时 stderr 末尾几十行全是栈帧
-            #   （#0..#19 加一整排寄存器），真正的死因（那行 FATAL / Check failed）
-            #   在栈【前面】，正好被 tail 挤出去。
-            #   tail 对"人写的日志"好用，对"崩溃转储"恰恰相反：越靠后越没信息量。
-            D=$(grep -aE 'FATAL|Check failed|Received signal|zygote|sandbox' "$F" | sort -u | head -n 8 || true)
-            MSG=$(printf '%s\n' "$D" | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
-            echo "::error::Chrome 死因行（库把它接进 PIPE 却从不读，所以这份只在此外存在）。共捕获 ${N} 次子进程启动：${MSG}"
-          else
-            echo "::notice::没有捕获到任何子进程输出 —— 说明库根本没走到起 Chrome 那一步，故障在更上游"
-          fi
+        run: python devtools/probe_browser.py --fatal-lines /tmp/chrome_capture.log
 
       - name: 把结论写进 job summary（即使失败也执行）
         if: always()

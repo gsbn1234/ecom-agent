@@ -81,7 +81,14 @@ def _ann(kind: str, msg: str) -> None:
       只做后者，CI 上就白跑。一行成本，两个场景都成立。
     """
     print(f"[{kind}] {msg}")
-    print(f"::{kind}::{msg}")
+    # ★ 注解要按 GitHub 的规则转义，否则消息里一个裸露的 % 就会让解析错位。
+    #   顺序不能反：必须【先】把 % 转成 %25，再转换行 ——
+    #   反过来的话，%0A 里的那个 % 会被第二次转义成 %250A，消息就坏了。
+    #   这条纪律原来写在 workflow 的 shell 里（sed -e 's/%/%25/g'），
+    #   把那段换成调用本脚本时差点丢掉 —— 所以它属于这里，属于唯一
+    #   生成注解行的地方，而不是每一处调用点。
+    esc = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{kind}::{esc}")
 
 
 def _port() -> int:
@@ -162,34 +169,61 @@ async def _try_launch(
     return verdict, stderr.decode("utf-8", "replace").strip(), proc.returncode
 
 
-def _fatal_lines(text: str) -> list[str]:
-    """从 Chrome 输出里挑出"为什么死"的那几行。
+# ── 从 Chrome 输出里挑出"为什么死"的那几行 ──────────────────
+#
+# ★ 为什么不能用 tail：实测踩过一次 —— Chrome 崩溃时 stderr 的末尾几十行
+#   全是栈帧（#0..#19 加一整排寄存器），真正的死因（那行 FATAL / Check failed）
+#   在栈【前面】，正好被 tail 挤出去。
+#   tail 对"人写的日志"好用，对"崩溃转储"恰恰相反：越靠后越没有信息量。
 
-    ★ 为什么不能用 tail：实测踩过一次 —— Chrome 崩溃时 stderr 的末尾几十行
-      全是栈帧（#0..#19 加一整排寄存器），真正的死因（那行 FATAL / Check failed）
-      在栈【前面】，正好被 tail 挤出去。
-      tail 对"人写的日志"好用，对"崩溃转储"恰恰相反：越靠后越没有信息量。
+# 一档：死亡关键词。命中就一定是死因，这类行【从来不会】出现在健康运行里。
+# ★ 这是白名单而不是黑名单，方向很重要 —— 见 fatal_lines 的 docstring。
+DEATH_MARKERS = ("FATAL", "Check failed", "Received signal", "zygote", "sandbox")
+
+# 二档：已知的良性噪声。只在【一条死亡关键词都没命中】时才用来兜底。
+#   形态必须是"一类噪声"，不能是"某次看到的那个字符串"：
+#   · cpufreq —— crashpad 读不到的 sysfs 文件
+#   · dbus/   —— 容器里没有 D-Bus。★ 匹配的是目录前缀而不是具体文件：
+#               第一版写死 "dbus/bus.cc"，下一次运行 Chrome 改从
+#               dbus/object_proxy.cc 报同样的错，白名单没命中，红字原样回来。
+KNOWN_NOISE = ("cpufreq", "dbus/")
+
+
+def fatal_lines(text: str) -> list[str]:
+    """从 Chrome 输出里挑出"为什么死"的那几行。返回值的语义见下。
+
+    ★★ 两档制，而不是"黑名单过滤 ERROR"。这个设计是被 bug 逼出来的：
+
+      第一版是黑名单 —— "所有 ERROR 行，除了噪声"。它有个致命的不对称：
+      **它保证会误报**。只要 runner 上还会冒出任何一种我没想到的良性 ERROR，
+      注解里就会出现一条没有信息量的红字，标题还写着「死因行」。
+      实测发生了两次（dbus/bus.cc 修完，下次变成 dbus/object_proxy.cc）。
+
+      而黑名单想换来的那个好处 —— "不放过未知故障" —— 用白名单加一档兜底
+      就能拿到：死亡关键词一条都没命中时，才退回去报那些非噪声的 ERROR。
+      那时它们是唯一线索，报出来是对的；而只要有真死因，它们就不会出现。
+
+      换句话说：**有真凶时只报真凶，没有真凶时才报嫌疑人。**
+      一份"总在喊狼来了"的注解，等于没有注解 —— 这是本项目反复吃到的同一个教训。
     """
-    # ★ 噪声白名单。这些 ERROR 在 runner 上必然出现，且与"起不来"无关：
-    #   · cpufreq      —— crashpad 读不到的 sysfs 文件
-    #   · dbus/bus.cc  —— 容器里没有 D-Bus，连不上是常态
-    #   把它们排掉不是因为它们不重要，而是因为【注解区里出现红字却没有信息量】
-    #   会训练人跳过注解 —— 这个通道就自己把自己废了。
-    #   实测踩过：修好之后 Chrome 起来了，注解里却还挂着一串 dbus ERROR，
-    #   标题写着"死因行"，读起来像是又崩了。
-    NOISE = ("cpufreq", "dbus/bus.cc")
-
-    out: list[str] = []
+    lines = [ln.strip() for ln in text.splitlines()]
     seen: set[str] = set()
-    for ln in text.splitlines():
-        s = ln.strip()
-        interesting = any(k in s for k in ("FATAL", "Check failed", "Received signal"))
-        if not interesting and "ERROR:" in s and not any(n in s for n in NOISE):
-            interesting = True
-        if interesting and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
+
+    def _dedup(items) -> list[str]:
+        out = []
+        for s in items:
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    primary = _dedup(s for s in lines if any(k in s for k in DEATH_MARKERS))
+    if primary:
+        return primary
+    # 兜底档：没有死亡关键词。此时非噪声的 ERROR 是我们仅有的线索。
+    return _dedup(
+        s for s in lines if "ERROR:" in s and not any(n in s for n in KNOWN_NOISE)
+    )
 
 
 # ★ 关沙箱用的三个参数，抄自库自己的 CHROME_DOCKER_ARGS
@@ -222,7 +256,7 @@ async def _sandbox_matrix(
             browser_path, [*base, f"--remote-debugging-port={port}", *extra], port
         )
         print(f"\n  [{label}] 结论={verdict} 退出码={code}")
-        for ln in _fatal_lines(err)[:4]:
+        for ln in fatal_lines(err)[:4]:
             print(f"      {ln}")
         out[label] = (verdict, code, err)
     return out
@@ -292,7 +326,53 @@ async def _library_launch(session_kw: dict) -> dict:
     return captured
 
 
+def _forensics(log_path: str) -> int:
+    """只读一份已经捕获的子进程输出，挑出死因行并抬成注解。
+
+    ★ 为什么让 CI 调这个脚本，而不是在 workflow 里再写一遍 grep：
+      "哪几行算死因"这件事原本有【两份实现】—— 本文件的 fatal_lines，
+      和 ci.yml 里的 `grep -aE 'FATAL|Check failed|Received signal|zygote|sandbox'`。
+      而且两者思路相反（一个黑名单、一个白名单），修好一份另一份还是错的，
+      且【没人会发现，因为两边都跑得动】。
+      CI 只该决定【什么时候】去看，不该决定【怎么看】。
+    """
+    p = Path(log_path)
+    if not p.exists() or not p.read_text(encoding="utf-8", errors="replace").strip():
+        _ann(
+            "notice",
+            "没有捕获到任何子进程输出 —— 说明库根本没走到起 Chrome 那一步，故障在更上游",
+        )
+        return 0
+
+    text = p.read_text(encoding="utf-8", errors="replace")
+    n = text.count(">>> 第 ")
+    fatals = fatal_lines(text)
+    print(f"捕获到 {n} 次子进程启动；死因行 {len(fatals)} 条")
+    for ln in fatals[:10]:
+        print(f"  {ln}")
+    if fatals:
+        _ann(
+            "error",
+            f"Chrome 死因行（库把它接进 PIPE 却从不读，所以这份只在此处存在）。"
+            f"共捕获 {n} 次子进程启动：" + " | ".join(fatals[:3]),
+        )
+    else:
+        # ★ 没挑出死因行【不等于没问题】：这份文件是"失败时才来看"的，
+        #   走到这里要么是失败发生在起 Chrome 之前，要么是 Chrome 说了句
+        #   我们还不认识的话。两种都该被看见，不能安静地什么都不报。
+        _ann(
+            "warning",
+            f"测试失败了，但这份捕获里挑不出死因行（共 {n} 次子进程启动）—— "
+            "故障可能发生在起 Chrome 之前，或者是一种没见过的失败形态。",
+        )
+    return 0
+
+
 def main() -> int:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--fatal-lines":
+        return _forensics(argv[1] if len(argv) > 1 else "/tmp/chrome_capture.log")
+
     print("=" * 70)
     print("浏览器探针")
     print("=" * 70)
@@ -406,7 +486,7 @@ def main() -> int:
         print("Chrome 输出: （空 —— 一个字都没写出来，说明它连初始化都没走完）")
     print("-" * 70)
 
-    fatals = _fatal_lines(log_text)
+    fatals = fatal_lines(log_text)
     if fatals:
         print("死因行（从崩溃转储里挑出来的，不是 tail）:")
         for ln in fatals[:6]:
