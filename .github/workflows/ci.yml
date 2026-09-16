@@ -37,14 +37,17 @@ jobs:
           ECOM_AGENT_ENABLE_LIVE_LLM: "false"
         run: |
           set +e
-          # ★ --tb=long + -rf，两个都是为了让【我们自己写的断言消息】活着到达注解：
-          #   · 这个项目的断言消息是精心写的诊断文本（往往是好几行的中文），
-          #     它们才是真正的失败原因。--tb=short 会把 raise 语句的源码上下文压成
-          #     "...<4 lines>..."，而 pytest 默认又不在结尾列失败清单 ——
-          #     结果是多个用例同时失败时，tail 只捞得到最后一个的栈。
-          #   · -rf 在输出【最末尾】补一份一行一条的失败清单，而注解取的正是 tail ——
-          #     于是"有几个挂了、各挂在哪一句"必定落在窗口里。
-          #   · 消息在末尾，tail 从末尾取，所以 --tb=long 撑长 traceback 也不会把它挤掉。
+          # ★ -rf：在输出【最末尾】补一份一行一条的失败清单，而注解取的正是 tail ——
+          #   于是"有几个挂了、各挂在哪一句"必定落在窗口里。多个用例同时挂时，
+          #   没有它，tail 只捞得到最后一个的栈。
+          #
+          # ⚠️ 这里原先写的是"加上 --tb=long 就能让被截断的消息显示完整"，那是错的。
+          #    实测：--tb=long 改完，输出里的 "...<4 lines>..." 逐字未变。
+          #    那个截断是【Python 3.11+ 的 traceback 模块自己】对多行语句干的
+          #    （任何 pytest 开关都关不掉）。而异常消息本身并没有被截 ——
+          #    它照常打印在 "RuntimeError: " 后面同一行。
+          #    所以 --tb=long 保留，但理由是"让断言的源码上下文完整"，
+          #    不是"解开截断"——后者是个不存在的开关，别再去找了。
           python -m pytest -v -m "not needs_browser" --tb=long -rf 2>&1 | tee /tmp/pytest_offline.log
           code=${PIPESTATUS[0]}
           set -e
@@ -119,17 +122,23 @@ jobs:
         run: python devtools/probe_browser.py
 
       - name: 跑浏览器测试
+        id: browser_tests
         env:
           DEEPSEEK_API_KEY: ci-dummy
           ECOM_AGENT_ENABLE_LIVE_LLM: "false"
           # 空串 → browser-use 的 find_chrome_executable() 去找 runner 上已装的 Chrome
           ECOM_AGENT_CHROME_PATH: ""
           ECOM_AGENT_HEADLESS: "true"
+          # ★ 让 tests/conftest.py 的钩子把子进程的 stdout/stderr 落到这个文件。
+          #   理由：库用 stderr=PIPE 起 Chrome 却从不读那个管道
+          #   （local_browser_watchdog.py:146-151），Chrome 的死因就是这么丢的。
+          #   钩子在 create_subprocess_exec 那一层把 PIPE 换成文件句柄。
+          ECOM_AGENT_CAPTURE_CHROME_LOG: /tmp/chrome_capture.log
         run: |
           set +e
-          # ★ 与 offline job 同款参数，理由见那边（--tb=long + -rf 是为了让
-          #   自己写的断言消息活着到达注解；pytest 的 "--tb=short 截断"
-          #   是这一轮排查里真实踩到的、我自己给自己挖的坑）。
+          # ★ 与 offline job 同款参数，理由见那边（-rf 保证失败清单落在 tail 里；
+          #   ⚠️ 那边还记了一件事：--tb=long 解不开 "...<N lines>...",
+          #   那是 Python 自己干的，不是 pytest）。
           python -m pytest -v -m "needs_browser" --tb=long -rf 2>&1 | tee /tmp/pytest_browser.log
           code=${PIPESTATUS[0]}
           set -e
@@ -157,6 +166,29 @@ jobs:
             exit 0
           fi
           exit "$code"
+
+      # ★ 把库丢弃的 Chrome 输出抬成注解（截获机制见 tests/conftest.py 的 _capture_child_process_stdio）。
+      #
+      #   为什么值得单独一步、而不是塞进上一步的 tail：
+      #   上一段 tail 的是【pytest 的输出】，而 Chrome 的死因从来不在那里 ——
+      #   它被接进了一个没人读的管道。这份捕获文件是唯一能看到它的地方，
+      #   所以它必须自己走一条注解，不能被 pytest 的 tail 顺带。
+      #
+      #   ★ if 条件里那个 outcome == 'failure' 不是装饰：
+      #     不加的话，每次绿跑也会在公开页面上留一条 error 注解 ——
+      #     而"注解区里总有红字"正是让人开始忽略注解的第一步，
+      #     这个通道就自己把自己废掉了。
+      - name: 把 Chrome 自己的输出抬成注解（库接了管道，却从不读它）
+        if: always() && steps.browser_tests.outcome == 'failure'
+        run: |
+          F=/tmp/chrome_capture.log
+          if [ -s "$F" ]; then
+            N=$(grep -c '>>> 第 ' "$F" || true)
+            MSG=$(tail -n 40 "$F" | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error::Chrome 自己的输出（库把它接进 PIPE 却从不读，所以这份只在此外存在）。共捕获 ${N} 次子进程启动，最后 40 行：${MSG}"
+          else
+            echo "::notice::没有捕获到任何子进程输出 —— 说明库根本没走到起 Chrome 那一步，故障在更上游"
+          fi
 
       - name: 把结论写进 job summary（即使失败也执行）
         if: always()
