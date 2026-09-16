@@ -170,13 +170,21 @@ def _fatal_lines(text: str) -> list[str]:
       在栈【前面】，正好被 tail 挤出去。
       tail 对"人写的日志"好用，对"崩溃转储"恰恰相反：越靠后越没有信息量。
     """
+    # ★ 噪声白名单。这些 ERROR 在 runner 上必然出现，且与"起不来"无关：
+    #   · cpufreq      —— crashpad 读不到的 sysfs 文件
+    #   · dbus/bus.cc  —— 容器里没有 D-Bus，连不上是常态
+    #   把它们排掉不是因为它们不重要，而是因为【注解区里出现红字却没有信息量】
+    #   会训练人跳过注解 —— 这个通道就自己把自己废了。
+    #   实测踩过：修好之后 Chrome 起来了，注解里却还挂着一串 dbus ERROR，
+    #   标题写着"死因行"，读起来像是又崩了。
+    NOISE = ("cpufreq", "dbus/bus.cc")
+
     out: list[str] = []
     seen: set[str] = set()
     for ln in text.splitlines():
         s = ln.strip()
         interesting = any(k in s for k in ("FATAL", "Check failed", "Received signal"))
-        # crashpad 那几条 cpufreq 的 ERROR 是 runner 上必然出现的噪声，不是死因
-        if not interesting and "ERROR:" in s and "cpufreq" not in s:
+        if not interesting and "ERROR:" in s and not any(n in s for n in NOISE):
             interesting = True
         if interesting and s not in seen:
             seen.add(s)

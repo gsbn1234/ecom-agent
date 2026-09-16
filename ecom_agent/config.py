@@ -54,8 +54,24 @@ if CHROME_PATH is None:
     # 未设置（None）→ 用平台默认值。
     CHROME_PATH = _DEFAULT_WIN_CHROME if sys.platform == "win32" else ""
 # ★ 区分「未设置」与「设为空串」：设成空串是明确要求 browser-use 自己探测，
-#   不能被上面的默认值覆盖。CI 里就是这么用的（见 ci.yml 的 env）。
+#   不能被上面的默认值覆盖。
 CHROME_PATH = CHROME_PATH.strip()
+
+# ⚠️⚠️ 「设为空串让库自己探测」现在【只推荐在开发机上用】，CI 上一律显式钉死。
+#   这是 2026-09-16 那轮 CI 全红换来的教训（完整记录见 docs/spikes.md）：
+#
+#   库里有【两份互不一致的清单】回答「哪个 Chrome」——
+#     · browser/chrome.py:find_chrome_executable()  走 which，google-chrome 优先
+#     · local_browser_watchdog.py:264-279（真正启动用的是这条）硬编码路径表，
+#       chromium 组优先（第 321-323 行 patterns = prioritized + rest）
+#   正常机器上两者挑中的是同一个二进制，所以看不出来；
+#   一旦机器上两个都装了、而其中一个的沙箱助手不可用，差别就是
+#   「CDP 就绪」与「SIGABRT，退出码 -6」的区别。GitHub runner 恰好就是这种情况：
+#     FATAL:zygote_host_impl_linux.cc:129] No usable sandbox! ... 退出码 -6
+#
+#   所以：凡是我们能控制的环境（CI、容器、别人的机器），都必须显式赋值，
+#   把「库挑哪个」这个不确定性从链路里摘掉。留空只在开发机上可接受 ——
+#   因为那里我们随时能用 devtools/probe_browser.py 看出来它挑了什么。
 
 HEADLESS = os.getenv("ECOM_AGENT_HEADLESS", "true").strip().lower() == "true"
 

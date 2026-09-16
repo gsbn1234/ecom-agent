@@ -30,8 +30,13 @@ jobs:
         env:
           # ★ 假 key：有些模块的导入期会读它。真值永远不进 CI。
           DEEPSEEK_API_KEY: ci-dummy
-          # ★ 空串 = 明确要求 browser-use 自己探测 Chrome，不走开发机的硬编码路径。
-          #   注意这里必须是空串而不是"不设置"—— 见 ecom_agent/config.py 的注释。
+          # ★ 空串在这里是安全的，且理由和 browser job 的钉死【不矛盾】：
+          #   这个 job 跑的是 `-m "not needs_browser"`，【从头到尾不会启动浏览器】，
+          #   所以"库会挑哪个二进制"这个不确定性压根不进入链路。
+          #   空串在这里的作用是明确"不走开发机的硬编码路径"，
+          #   而不是"让库自己挑"—— 见 ecom_agent/config.py 的注释。
+          #   ⚠️ 如果哪天有人往这个 job 里加了 needs_browser 用例，这里必须同步改成钉死，
+          #      否则会撞上 browser job 那个"库挑中没有可用沙箱的 chromium"的坑。
           ECOM_AGENT_CHROME_PATH: ""
           # 双保险：即使有人误加了 key，这个开关不打开就不会真的联网。
           ECOM_AGENT_ENABLE_LIVE_LLM: "false"
@@ -177,6 +182,16 @@ jobs:
             MSG=$(tail -n 80 /tmp/pytest_browser.log | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
             echo "::error::needs_browser 测试失败（退出码 ${code}）。最后 80 行：${MSG}"
           fi
+
+          # ★★ 无论绿红，都报一句【到底跑了几条】。
+          #   为什么必要：这个 job 是 continue-on-error，"8 条全过"和
+          #   "一条都没收集到"（退出码 5）在 step 层面【都是 success】——
+          #   同一种颜色代表两种截然相反的状态，正是这个 job 最该避免的病。
+          #   pytest 末行的 summary（"8 passed in 12.34s"）是唯一能区分二者的东西，
+          #   把它抬成公开注解，"绿"这个字以后才有确定含义。
+          #   用 -rf 的副作用之一也在这里：失败清单落在末尾，所以 tail 抓得到。
+          SUMMARY=$(grep -aoE '[0-9]+ (passed|failed|error|skipped)[^=]*' /tmp/pytest_browser.log | tail -n 1)
+          echo "::notice::needs_browser 实际结果：${SUMMARY:-（没抓到 summary 行 —— 存疑，别当成绿）}；退出码 ${code}"
 
           # ★ 必须显式区分退出码 5（未收集到任何用例）和 1（用例真的失败了）。
           #

@@ -97,3 +97,29 @@ uv run pytest -m needs_browser     # 需要真实浏览器：对着本地 mock �
 理由：CI 里启动 Chromium 依赖 runner 沙箱、Chrome 版本、一组 apt 包，
 任一环变化都会红 —— 但那是环境问题不是代码问题。混在一起会让两者看起来一样，
 久而久之没人看 CI。分开之后，"代码坏了"和"CI 机器没配好"一眼可辨。
+
+CI 上**显式钉死二进制**：`ECOM_AGENT_CHROME_PATH=/usr/bin/google-chrome`。
+不是随手写的路径，而是踩过一轮全红之后定的，原因值得单独说 ——
+
+**browser-use 0.13.10 内部有两份互不一致的清单回答「哪个 Chrome」**：
+
+| 用在哪 | 位置 | 策略 |
+|---|---|---|
+| 库**真正启动**用的那条 | `local_browser_watchdog.py:264-279` | 硬编码路径表，**chromium 组优先** |
+| 同库另一个公开函数 | `browser/chrome.py:find_chrome_executable()` | 走 `which`，**google-chrome 优先** |
+
+正常机器上两者挑中的是同一个二进制，所以这个分歧看不出来。一旦两个都装了、
+而其中一个的沙箱助手不可用，差别就是「CDP 就绪」和「SIGABRT，退出码 -6」——
+GitHub runner 恰好就是这种情况，而 Chromium 那边给出的死因是：
+
+```
+FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc:129] No usable sandbox!
+```
+
+**修法是钉一个带可用沙箱的二进制，而不是 `chromium_sandbox=False` 关掉沙箱。**
+关沙箱同样能让 CI 变绿（`devtools/probe_browser.py` 的对照段在 runner 上验证过），
+但那是以降低安全姿态换绿色 —— 对一个通篇在讲护栏的项目，这是本末倒置。
+
+完整排查记录（含逐字证据、为什么 `tail` 对崩溃转储是反向的、
+以及「探针必须和被测对象共享同一份环境」这条教训）见 [`docs/spikes.md`](docs/spikes.md)。
+诊断脚本本身是 `devtools/probe_browser.py`，本地也能跑。
