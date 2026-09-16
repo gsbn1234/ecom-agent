@@ -5,8 +5,14 @@
 不改动 browser-use 源码 —— 把它当执行引擎，上层包自己的业务逻辑：任务 DSL、三层安全护栏、
 结构化落库、逐步可观测与回放。首个适配平台是拼多多商家后台（`mms.pinduoduo.com`）。
 
-> 🚧 施工中。当前进度：**Phase 0（骨架 + CI）**。
-> 各阶段验收标准见 `docs/`（Phase 1 起陆续补齐）。
+> 🚧 施工中。当前进度：**Phase 2 已完成**（骨架 / DSL + 护栏策略 / 真浏览器探路）。
+> 下一步 Phase 3：可观测 + runner + 落库（`main.py run` 产出 `runs/{id}/` 全套产物）。
+>
+> 已完成的文档：`docs/spikes.md`（七项探路的实测结论）、
+> `docs/guardrail_design.md`（三层护栏各能挡什么、**挡不住什么**）。
+>
+> 测试现状：153 条 = 145 条离线（CI 硬门禁）+ 8 条 `needs_browser`
+> （本地硬门禁；CI 上已跑通，见 CI 说明）。
 
 ---
 
@@ -57,6 +63,10 @@ uv run python main.py run tasks/books_demo.yaml    # 用公开练手站点，不
 
 另外，**公开演示用的全部数据来自本地 mock 站点**（`devtools/mock_pdd/`），
 仓库里不含任何真实店铺数据。
+
+护栏怎么做到上面这些、以及**它做不到哪些**，见
+[`docs/guardrail_design.md`](docs/guardrail_design.md) ——
+那份文档的规矩是「挡不住什么」比「挡什么」重要，每层都写了失效边界和实测依据。
 
 ---
 
