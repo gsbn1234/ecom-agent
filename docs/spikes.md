@@ -466,3 +466,99 @@ E       assert 4 == 1
 
 关键细节：失败发生在第 163 行，也就是**它先通过了**前面那条「URL 里有 /page2」的断言。
 这正好印证了那句判断——一条会放过「把任务搞死」的断言等于没断言。
+
+---
+
+## 追加：CI 上浏览器全红的根因（2026-09-16 排查记录）
+
+Phase 2 的 8 条契约测试在本地全绿，在 CI 上全红。这份记录留在这里，因为
+**根因是一条未文档化的库行为，而且它的失败形态指向完全错误的方向**。
+
+### 现象与三轮误判
+
+| 轮次 | 我看到什么 | 我的判断 | 实际 |
+|---|---|---|---|
+| 1 | `needs_browser` 全红，公开注解只有 `Process completed with exit code 1` | 日志读不到，先修"注解"通道 | 对了（`b27a86b`） |
+| 2 | 注解给到 `local_browser_watchdog.py:428 raise RuntimeError` | 猜"Chromium 在 runner 上装不上"（R9） | **错**，探针一次就报出 `/usr/bin/google-chrome` 在 |
+| 3 | 探针报"环境没问题"、测试照红；我以为是 pytest 把消息截了 | 改 `--tb=long` | **错**，`...<N lines>...` 是 Python 3.11+ `traceback` 模块自己干的，与 pytest 无关 |
+
+第 3 轮那次错得很典型：**我在找一个不存在的开关**。花了一轮 CI 才验证
+`--tb=long` 改完输出逐字未变。教训：改之前先用一行脚本在本地确认那个截断是谁产生的。
+
+### 真正卡住的不是 traceback，是一个没人读的管道
+
+```
+local_browser_watchdog.py:146-151
+    subprocess = await asyncio.create_subprocess_exec(
+        browser_path, *launch_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,     # ← 全库没有一行读它
+    )
+```
+
+第 428 行的 `RuntimeError` 消息是**硬编码**的通用提示（"可能要 `--no-sandbox`"），
+所以补 traceback 永远补不出死因。死因一直在 Chrome 的 stderr 里，被接了管道却没人听。
+
+**办法：既然库不读那个管道，那就别用管道。** 在 `create_subprocess_exec` 这一层
+把 `PIPE` 换成文件句柄 —— 不去改库，也不用去数库里有几个启动点。
+见 `devtools/probe_browser.py` 第二段和 `tests/conftest.py::_capture_child_process_stdio`。
+
+### 拿到的逐字证据
+
+```
+FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc:129] No usable sandbox! If you
+are running on Ubuntu 23.10+ or another Linux distro that has disabled unprivileged user
+namespaces with AppArmor, see https://chromium.googlesource.com/chromium/src/+/main/docs/
+security/apparmor-userns-restrictions.md. ... If you want to live dangerously and need an
+immediate workaround, you can try using --no-sandbox.
+Received signal 6
+#12 content::ZygoteHostImpl::Init()
+退出码 = -6
+```
+
+### 根因：库里有**两份**清单回答"哪个 Chrome"
+
+```
+两者不是同一个二进制！探针=/usr/bin/google-chrome / 库=/usr/bin/chromium
+```
+
+| 用在哪 | 函数 | 策略 | runner 上的结果 |
+|---|---|---|---|
+| 探针（我按 `config.CHROME_PATH or` 它） | `browser/chrome.py:find_chrome_executable()` | `which google-chrome\|google-chrome-stable\|chromium\|chromium-browser`，**google-chrome 优先** | `/usr/bin/google-chrome` ✅ |
+| **库里真正启动用的那条** | `local_browser_watchdog.py:264-279` `_find_installed_browser_path()` | 硬编码路径表，**chromium 组优先**（`prioritized + rest`，第 321-323 行） | `/usr/bin/chromium` ❌ |
+
+两者的差别在正常机器上看不出来（挑中的是同一个二进制），**只在两个二进制都存在
+且其中一个沙箱不可用时才暴露** —— 而这恰好就是 GitHub runner 的情况：
+
+- `/usr/bin/chromium` 没有可用的沙箱助手 → `No usable sandbox!` → `LOG(FATAL)` → SIGABRT
+- `/usr/bin/google-chrome` 的 deb 带 setuid 的 `chrome-sandbox` → 沙箱可用
+
+所以同一份 `get_args()`、同一个 runner、同一个 headless，**只换二进制就从
+"CDP 就绪"变成进程秒退**。这也是为什么第一轮探针会得出"环境没问题"——
+它测的是另一个二进制。
+
+### 修法与取舍
+
+**钉死二进制**（`ci.yml` 的 `ECOM_AGENT_CHROME_PATH: /usr/bin/google-chrome`），
+而不是 `BrowserSession(chromium_sandbox=False)` 关沙箱。
+
+关沙箱那一条探针已经在本 runner 上验证可行（"对照结论：同一条库路径，
+`chromium_sandbox=False` 就起得来"），但那是**用降低安全姿态换绿色**。
+这个项目通篇在讲护栏，为了 CI 变绿去关掉浏览器自己的沙箱是本末倒置。
+钉一个带可用沙箱的二进制，效果一样而不用让步。
+
+两个附带结论：
+
+1. **探针必须和被测对象共享同一份环境**，否则它会给出自信的错答案。
+   之前 env 挂在测试 step 上、探针 step 没有，两者测的不是同一个浏览器 ——
+   这就是"环境没问题"这句错结论的来源。现在 env 提到 job 层。
+2. `ECOM_AGENT_CHROME_PATH` 从"CI 上设成空串、让库自己探测"改成"CI 上也显式钉死"。
+   理由见上：让库自己挑，挑的是哪一份清单是不确定的。
+
+### 取证方式的一条经验
+
+注解原来取 `tail -40`，拿到的末尾几十行全是栈帧和寄存器；死因（那行 `FATAL`）
+在栈**前面**，正好被挤出去。改成 grep `FATAL|Check failed|Received signal|zygote|sandbox`。
+
+**`tail` 对"人写的日志"好用，对"崩溃转储"恰恰相反：越靠后越没有信息量。**
+差一点就因为"末尾没看到 FATAL"而得出"没有 FATAL 行"的结论。

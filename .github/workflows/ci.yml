@@ -84,6 +84,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
+    # ★ env 放在 job 层而不是各 step 层 —— 这是本轮排查换来的教训：
+    #   之前探针步骤没有 env、测试步骤有一份，于是【两者测的不是同一个浏览器】，
+    #   探针报"环境没问题"而测试照红，白烧了两轮 CI。
+    #   探针只有在与测试共享同一份环境时才有意义。
+    env:
+      DEEPSEEK_API_KEY: ci-dummy
+      ECOM_AGENT_ENABLE_LIVE_LLM: "false"
+      ECOM_AGENT_HEADLESS: "true"
+      # ★★ 必须显式钉死，不能让库自己挑。这是本轮 CI 全红的根因，实测证据：
+      #
+      #    两者不是同一个二进制！探针=/usr/bin/google-chrome / 库=/usr/bin/chromium
+      #    FATAL:zygote_host_impl_linux.cc:129] No usable sandbox! If you are running
+      #      on Ubuntu 23.10+ ... that has disabled unprivileged user namespaces with
+      #      AppArmor ... you can try using --no-sandbox.
+      #
+      #   原因：库里有【两份不同的清单】回答"哪个 Chrome" ——
+      #     · browser/chrome.py:find_chrome_executable() 走 which，优先 google-chrome；
+      #     · local_browser_watchdog.py:264-279（真正启动用的那条）是硬编码路径表，
+      #       chromium 组优先，于是挑中 /usr/bin/chromium。
+      #   而 runner 上的 /usr/bin/chromium 没有可用的沙箱助手（No usable sandbox!），
+      #   Google Chrome 的 deb 则带 setuid 的 chrome-sandbox —— 所以同一份参数、
+      #   同一个 runner，换一个二进制就从"CDP 就绪"变成 SIGABRT。
+      #
+      #   ★ 为什么钉 google-chrome 而不是用 chromium_sandbox=False 关掉沙箱：
+      #     关沙箱也能过（探针的对照段已在 runner 上验证过），但那是【降低安全姿态】
+      #     换绿色 —— 这个项目通篇在讲护栏，为了 CI 变绿去关掉浏览器自己的沙箱，
+      #     是本末倒置。钉一个带可用沙箱的二进制，效果一样而不用让步。
+      #     真到了 google-chrome 也起不来的那天，探针会报"开/关都起不来"，
+      #     那时再考虑 chromium_sandbox=False，且必须在 docs 里写明代价。
+      ECOM_AGENT_CHROME_PATH: /usr/bin/google-chrome
+      # 让 tests/conftest.py 的钩子把子进程的 stdout/stderr 落到这个文件。
+      # 理由：库用 stderr=PIPE 起 Chrome 却从不读那个管道
+      # （local_browser_watchdog.py:146-151），Chrome 的死因就是这么丢的。
+      ECOM_AGENT_CAPTURE_CHROME_LOG: /tmp/chrome_capture.log
     steps:
       - uses: actions/checkout@v4
 
@@ -123,17 +157,6 @@ jobs:
 
       - name: 跑浏览器测试
         id: browser_tests
-        env:
-          DEEPSEEK_API_KEY: ci-dummy
-          ECOM_AGENT_ENABLE_LIVE_LLM: "false"
-          # 空串 → browser-use 的 find_chrome_executable() 去找 runner 上已装的 Chrome
-          ECOM_AGENT_CHROME_PATH: ""
-          ECOM_AGENT_HEADLESS: "true"
-          # ★ 让 tests/conftest.py 的钩子把子进程的 stdout/stderr 落到这个文件。
-          #   理由：库用 stderr=PIPE 起 Chrome 却从不读那个管道
-          #   （local_browser_watchdog.py:146-151），Chrome 的死因就是这么丢的。
-          #   钩子在 create_subprocess_exec 那一层把 PIPE 换成文件句柄。
-          ECOM_AGENT_CAPTURE_CHROME_LOG: /tmp/chrome_capture.log
         run: |
           set +e
           # ★ 与 offline job 同款参数，理由见那边（-rf 保证失败清单落在 tail 里；
