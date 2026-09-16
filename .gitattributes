@@ -1,0 +1,13 @@
+# ★ 存在的理由：本项目在 Windows 上开发、在 Linux 上跑 CI。
+#   不统一换行符的话，同一份 YAML 在两边会被判定为"整个文件都改了"——
+#   每个 PR 都显示几百行 diff，review 的人会直接放弃看 diff，等于失去 code review。
+* text=auto
+
+# YAML 任务模板是 git 一等公民，必须锁定 LF：CRLF 会进 LLM 提示词。
+*.yaml text eol=lf
+*.yml  text eol=lf
+
+# 二进制，别碰
+*.png binary
+*.jpg binary
+*.db  binary

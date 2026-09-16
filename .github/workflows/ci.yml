@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:   # 手动触发，方便只改文档时验证 workflow 本身没坏
+
+jobs:
+  # ── 离线门禁：这是硬门禁，红了就是坏了 ────────────────────────────
+  offline:
+    name: 离线测试（零 token / 零网络 / 零浏览器）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+
+      - name: 安装
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 跑离线测试
+        env:
+          # ★ 假 key：有些模块的导入期会读它。真值永远不进 CI。
+          DEEPSEEK_API_KEY: ci-dummy
+          # ★ 空串 = 明确要求 browser-use 自己探测 Chrome，不走开发机的硬编码路径。
+          #   注意这里必须是空串而不是"不设置"—— 见 ecom_agent/config.py 的注释。
+          ECOM_AGENT_CHROME_PATH: ""
+          # 双保险：即使有人误加了 key，这个开关不打开就不会真的联网。
+          ECOM_AGENT_ENABLE_LIVE_LLM: "false"
+        run: python -m pytest -v -m "not needs_browser"
+
+  # ── 浏览器门禁：尽力跑，失败不阻塞 ──────────────────────────────
+  #
+  # ★ 为什么单独一个 job 且 continue-on-error：
+  #   browser-use 要在 CI 里启动真实 Chromium。这依赖 runner 的沙箱设置、
+  #   Chrome 版本、以及一组 apt 包，任何一环变化都会让它红 —— 而那是
+  #   【环境问题，不是代码问题】。把它和离线门禁混在一个 job 里，
+  #   会让"代码坏了"和"CI 机器没配好"看起来一模一样，久而久之没人看 CI。
+  #
+  # ★ 为什么不干脆不跑：
+  #   完全不跑的话，浏览器路径的代码在 CI 上零覆盖，而它恰恰是最容易坏的部分。
+  #   "本地是硬门禁，CI 是尽力跑"—— 这个区别明确写出来，比假装 CI 全绿诚实，
+  #   也比直接删掉这个 job 负责。
+  browser:
+    name: 浏览器测试（尽力跑）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+
+      - name: 安装
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 装 Chromium 依赖（失败继续，不影响后续步骤的结论）
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libnss3 libatk-bridge2.0-0 libgtk-3-0 \
+            libgbm1 libasound2t64 fonts-noto-cjk || true
+
+      - name: 跑浏览器测试
+        env:
+          DEEPSEEK_API_KEY: ci-dummy
+          ECOM_AGENT_ENABLE_LIVE_LLM: "false"
+          # 空串 → browser-use 的 find_chrome_executable() 去找 runner 上已装的 Chrome
+          ECOM_AGENT_CHROME_PATH: ""
+          ECOM_AGENT_HEADLESS: "true"
+        run: python -m pytest -v -m "needs_browser"
+
+      - name: 把结论写进 job summary（即使失败也执行）
+        if: always()
+        run: |
+          {
+            echo "### 浏览器门禁"
+            echo ""
+            echo "本 job 是 \`continue-on-error: true\`，红不代表代码坏了。"
+            echo "本地必须过：\`pytest -m needs_browser\`"
+          } >> "$GITHUB_STEP_SUMMARY"

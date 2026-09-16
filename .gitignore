@@ -1,0 +1,28 @@
+# ★ 第一行就排除 .venv/，不是为了整洁，是为了性能。
+#   不排除的话，每次 git status / ripgrep / IDE 索引都要扫几万个第三方文件，
+#   本项目后期会频繁跑测试与检索，这个开销是持续付的。
+.venv/
+venv/
+
+# 运行产物：截图 + steps.jsonl + sqlite。可能含店铺名等业务信息，绝不入库。
+runs/
+
+# 凭据与浏览器 profile。profile 里带登录 cookie，泄漏 = 别人能登你的后台。
+secrets/
+browser_profile/
+.env
+
+# Python 常规
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 数据库（兜底：万一有人把 db 建到了 runs/ 外面）
+*.db
+*.sqlite3
+
+# 编辑器
+.idea/
+.vscode/

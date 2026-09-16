@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ecom-agent"
+version = "0.1.0"
+description = "基于 browser-use 二次开发的电商卖家后台自动化助手"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+
+dependencies = [
+    # ★ 精确锁死，不用 >=。
+    #   0.13.x 期间发生过大规模 API 重命名：Controller→Tools、Browser→BrowserSession、
+    #   max_steps 从构造函数搬到 run()。浮动版本会让整个项目在某个早上突然全红，
+    #   而且报错信息指向的是"参数不存在"，不是"版本变了"。
+    #   本项目另有四个设计压在未文档化的行为上（见 docs/ADR.md 第 13 条），
+    #   所以宁可手动升，也不要自动漂。升级流程见 tests/test_compat.py 顶部注释。
+    "browser-use==0.13.10",
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",   # FastAPI TestClient 的底层依赖，不显式装会 ImportError
+]
+
+[tool.hatch.build.targets.wheel]
+# 显式声明包，不靠自动发现：本项目根目录还有 webapp/ devtools/ 等同级包，
+# 自动发现会把它们一起打进 wheel，或者更糟——猜错入口。
+packages = ["ecom_agent"]
