@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import re
 import threading
 import time
@@ -32,6 +33,7 @@ from fastapi.testclient import TestClient
 from ecom_agent.guardrails.approver import ApprovalOutcome, ApprovalRequest, WebApprover
 from ecom_agent.observability.events import RunEvent
 from ecom_agent.observability.models import COMPLETED, RunRecord
+from ecom_agent.runtime.profile import write_mark
 from ecom_agent.runtime.runner import PreflightError, RunOutcome
 from webapp.app import create_app
 
@@ -307,6 +309,104 @@ def test_bad_params_are_rejected_before_anything_starts(env, blocking_runner):
         assert r.status_code == 400
         assert "limit" in r.json()["detail"], r.json()["detail"]
         assert calls == [], "参数非法却已经把 run 跑起来了 —— 校验太晚了"
+
+
+def test_web_layer_passes_the_login_profile_through(env, monkeypatch, tmp_path):
+    """★★ 守卫：登录 profile 这个字段，**Web 这条通道也真的发了**。
+
+    动机是 Phase 6 查出来的一处**不会报错**的缺口：`compile_task` 支持
+    `user_data_dir`，CLI 侧传了、Web 侧一直没传。后果是同一份模板、同一个任务，
+    CLI 上正常、在看板上**永远停在登录页**：agent 按任务文本第 1 步停下 →
+    退出码 0 → report.html 齐全 → sqlite **零行**。
+
+    这正是本项目反复出现的那一类缺陷（"前端读一个字段，某个通道从没发过它"，
+    Phase 5 一晚出现过四次），所以它值得一条专门的守卫，而不是"我改过了"。
+
+    ★ 断言的是**注入的 runner 实际收到的东西**（`compiled.browser_kwargs`），
+      不是 app.py 里那一行的写法 —— 后者是断言实现，改个写法测试就红；
+      而真正要守的是"这个字段确实流到了消费它的地方"。
+    """
+    build, tmp = env
+    profile = tmp / "profile"
+    profile.mkdir()
+    write_mark(
+        profile,
+        site="mms.pinduoduo.com",
+        logged_in_url="https://mms.pinduoduo.com/goods/goods_list",
+        verified_at="2026-09-17T12:00:00+00:00",
+    )
+    monkeypatch.setattr("webapp.app.USER_DATA_DIR", str(profile))
+
+    seen: dict = {}
+    called = threading.Event()
+
+    async def capture(compiled, *, approver, run_id, events, runs_dir):
+        seen["browser_kwargs"] = dict(compiled.browser_kwargs)
+        called.set()
+        return _outcome(compiled, run_id, runs_dir)
+
+    with TestClient(build(run_func=capture)) as client:
+        r = client.post("/api/runs", json={"template_id": "good.yaml", "params": {"limit": 3}})
+        assert r.status_code == 202, r.text
+        assert called.wait(10), "runner 没被调用 —— 后台任务没起来"
+
+    assert seen["browser_kwargs"].get("user_data_dir") == str(profile), (
+        f"Web 层没把登录 profile 传下去：{seen['browser_kwargs']}\n"
+        "后果不是报错，是看板上跑登录类模板时零行数据。"
+    )
+
+
+def test_a_login_template_without_a_usable_profile_logs_a_warning(env, monkeypatch, tmp_path, caplog):
+    """★★ 对照实验：看板起"需要登录"的模板时，服务端必须说话 —— 且**只在真有问题时**说。
+
+    ① `USER_DATA_DIR` 为空（新克隆/CI 的默认）→ 必须有一条 WARNING，
+       而且那句话里要含 `check_profile` 给出的可照抄下一步；
+    ② 配好且已登录 → **一条 WARNING 都不该有**。
+
+    ★ 没有 ② 的话，"无条件打警告"的实现也能让 ① 通过 —— 而那种实现等于
+      把警告变成背景噪声，真出问题时没人会看见。这是本项目所有对照实验的同一条理由。
+    """
+    build, tmp = env
+    (tmp / "tasks" / "login.yaml").write_text(
+        GOOD_TEMPLATE.replace("requires_login: false", "requires_login: true"),
+        encoding="utf-8",
+    )
+
+    async def noop(compiled, *, approver, run_id, events, runs_dir):
+        return _outcome(compiled, run_id, runs_dir)
+
+    def start(client) -> None:
+        r = client.post("/api/runs", json={"template_id": "login.yaml", "params": {"limit": 3}})
+        assert r.status_code == 202, r.text
+
+    def our_warnings() -> list[str]:
+        # ★ 只看我们自己的 logger：uvicorn/httpx 的 WARNING 与本用例无关，
+        #   把它们算进来会让这条断言变成"环境干不干净"而不是"我们说不说话"。
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "webapp.app" and r.levelno >= logging.WARNING
+        ]
+
+    caplog.set_level(logging.WARNING)
+
+    with TestClient(build(run_func=noop)) as client:
+        # ① 需要登录，但 profile 没配
+        monkeypatch.setattr("webapp.app.USER_DATA_DIR", "")
+        caplog.clear()
+        start(client)
+        hits = [m for m in our_warnings() if "需要登录态" in m]
+        assert hits, f"需要登录的模板 + 没配 profile，却一句话都没说：{our_warnings()}"
+        assert "ECOM_AGENT_USER_DATA_DIR=" in hits[0], "警告里要给出可照抄的下一步"
+
+        # ② 已登录过（对照）
+        ready = tmp / "ready_profile"
+        ready.mkdir()
+        write_mark(ready, site="s", logged_in_url="u", verified_at="t")
+        monkeypatch.setattr("webapp.app.USER_DATA_DIR", str(ready))
+        caplog.clear()
+        start(client)
+        assert our_warnings() == [], "登录态是好的却还在警告 —— 警告会变成没人看的背景噪声"
 
 
 def test_start_run_returns_before_the_run_finishes(env, blocking_runner):

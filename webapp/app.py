@@ -40,11 +40,13 @@ from ecom_agent.config import (
     LIVE_LLM,
     RUNS_DIR,
     TASKS_DIR,
+    USER_DATA_DIR,
 )
 from ecom_agent.dsl.compiler import CompiledTask, ParamError, compile_task
 from ecom_agent.dsl.loader import TaskLoadError, load_task
 from ecom_agent.guardrails.approver import WebApprover
 from ecom_agent.observability.events import EventBus, events_from_run_dir
+from ecom_agent.runtime.profile import check_profile
 from ecom_agent.runtime.runner import PreflightError, RunOutcome, run_task
 
 logger = logging.getLogger(__name__)
@@ -265,11 +267,30 @@ def create_app(
             raise HTTPException(status_code=400, detail=f"模板加载失败：{exc}") from exc
 
         try:
-            compiled = compile_task(spec, body.params)
+            # ★★ 登录 profile 必须**在这里也**传下去（Phase 6 补的缺口）。
+            #
+            #   `compile_task` 有一个 user_data_dir 参数，CLI 侧传了，Web 侧一直
+            #   没传 —— 于是同一份模板、同一个任务，**CLI 上正常、Web 上永远看到
+            #   登录页**：agent 按任务文本第 1 步停下、退出码 0、report.html 齐全、
+            #   sqlite 零行。不报错、不崩溃，只是没有数据。
+            #
+            #   这是本项目反复出现的那一类缺陷（"某个通道从没发过这个字段"，
+            #   在 Phase 5 一晚出现过四次），所以它有一条专门的守卫：
+            #   `tests/test_api.py::test_web_layer_passes_the_login_profile_through`。
+            compiled = compile_task(spec, body.params, user_data_dir=USER_DATA_DIR)
         except ParamError as exc:
             # ★ 参数错误在**创建浏览器之前**就被拦下（compile_task 的顺序保证）。
             #   400 而不是 500：这是调用方的输入问题，不是服务坏了。
             raise HTTPException(status_code=400, detail=f"参数不合法：{exc}") from exc
+
+        # ★ 用前把"这次的登录态到底行不行"写进服务端日志。
+        #   为什么不做成 SSE 事件给前端：那是 run **开始之后**才有的通道，
+        #   而这句话是给**操作看板的人**看的（他要在观众面前决定要不要点开始）。
+        #   ⚠️ 已知不够好：服务端日志演示时没人看，这条留到 Phase 7 再想怎么上屏。
+        if spec.requires_login:
+            problem = check_profile(USER_DATA_DIR)
+            if problem:
+                logger.warning("模板 %s 需要登录态，但 %s", spec.id, problem)
 
         # ★ run_id 由这里生成并**交给** runner，而不是让 runner 自己造了再回来问。
         #   因为总线、审批通道、看板都要在 run 开始**之前**就拿着同一个 id ——
