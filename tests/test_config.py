@@ -33,6 +33,30 @@ def cfg():
     importlib.reload(config)
 
 
+@pytest.fixture
+def cfg_without_dotenv(cfg, monkeypatch):
+    """一份**没有读过 `.env`** 的 config —— 也就是 CI 上、或刚 clone 下来看到的样子。
+
+    ★ 为什么必须存在这个夹具：`config.py` 在导入时执行 `load_dotenv()`，
+      所以本机 `.env` 里**任何一个键**都会漏进这些配置常量。
+      而 `.env.example` 里明确教人填 `ECOM_AGENT_USER_DATA_DIR`（Phase 6 真站点那步）
+      —— 于是"照着文档认真做完的人，`uv run pytest` 突然红一条"，
+      而他没有任何理由怀疑那条测试的写法。（这不是推演：配完之后实测就是红的。）
+
+    ★ 屏蔽的是 **`.env` 文件**这条通道，不是环境变量那条。
+      环境变量必须照常生效，否则 `test_user_data_dir_env_override_wins`
+      会悄悄变成在测一个假的实现。下面那条对照用例专门钉这一点。
+
+    ★ 为什么连 `delenv` 也要做：夹具 `cfg` 在建立时已经 reload 过一次，
+      `.env` 的值那时就已经进了 `os.environ`；只把 `load_dotenv` 换成空函数
+      并不能把它请出去（`os.getenv` 读的是 `os.environ`，不是文件）。
+    """
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **kw: False)
+    monkeypatch.delenv("ECOM_AGENT_USER_DATA_DIR", raising=False)
+    importlib.reload(cfg)
+    yield cfg
+
+
 def test_project_root_anchored_to_config_location():
     """PROJECT_ROOT 是由 config.py 自身位置推出来的，不是 CWD。
 
@@ -67,15 +91,30 @@ def test_chrome_path_empty_string_means_autodetect(cfg):
     assert importlib.reload(cfg).CHROME_PATH == ""
 
 
-def test_user_data_dir_is_empty_by_default(cfg):
+def test_user_data_dir_is_empty_by_default(cfg_without_dotenv):
     """★ 默认必须是"不使用持久 profile"。
 
     ★★ 这条守的是一个**语义**问题，不是格式问题：持久 profile 是**有状态**的
       （里面是登录 cookie）。把有状态的东西设成默认，等于让 CI 的浏览器用例
       共用一个 cookie 目录 —— 互相污染，且只在特定执行顺序下才暴露。
       默认无状态 = 每次跑都从同一个起点出发，可复现。
+
+    ★ 这里用 `cfg_without_dotenv` 而不是 `cfg`：本机 `.env` **就是**一份配置，
+      而这条测的是「没配置过」时的默认值。用 `cfg` 的话，一个按文档配好了
+      真站点 profile 的人会让它变红 —— 红得毫无道理，且指向错误的嫌疑人。
     """
-    assert cfg.USER_DATA_DIR == ""
+    assert cfg_without_dotenv.USER_DATA_DIR == ""
+
+
+def test_the_without_dotenv_fixture_still_honours_the_environment_variable(cfg_without_dotenv):
+    """★ 对照：上面那个夹具屏蔽的是 `.env` **文件**，不是环境变量本身。
+
+    没有这一半的话，一个"永远返回空串"的实现也能让上面那条通过 ——
+    而那种实现会让 `test_user_data_dir_env_override_wins` 变成在测假东西。
+    两半分开写，才分得清"是配置真的没进来"还是"读配置的那条路断了"。
+    """
+    os.environ["ECOM_AGENT_USER_DATA_DIR"] = "/tmp/prof"
+    assert importlib.reload(cfg_without_dotenv).USER_DATA_DIR == "/tmp/prof"
 
 
 def test_user_data_dir_empty_string_is_not_replaced_by_the_convention(cfg):
