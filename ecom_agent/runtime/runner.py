@@ -498,7 +498,10 @@ class TaskRunner:
             # ★★ 接线自检必须在 run 之前。护栏的拒绝是"往动作列表里塞一个
             #    guard_notice"，而那个动作是 Agent 构造时按注册表生成的。
             #    接线不对时判定照做、记录照写、**动作照跑** —— 看起来在跑。
-            interceptor.check_wiring(agent)
+            # ★ 必须 await：它除了查动作模型，还要**真的 await 一次**
+            #   `should_stop` —— 库要求那个回调是 Awaitable，同步版会让
+            #   每一步都抛 'bool' object can't be awaited（详见其 docstring）。
+            await interceptor.check_wiring(agent)
 
             try:
                 history = await agent.run(

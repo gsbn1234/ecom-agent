@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Iterable
 
@@ -89,7 +90,7 @@ class GuardrailInterceptor:
         self._action_model: Any = None
 
     # ── 接线自检 ──────────────────────────────────────────
-    def check_wiring(self, agent: Any) -> None:
+    async def check_wiring(self, agent: Any) -> None:
         """构造完 Agent、**跑起来之前**调一次。接线不对就当场报错。
 
         ★ 为什么值得为此中断启动：
@@ -101,9 +102,16 @@ class GuardrailInterceptor:
           字段名那条路我踩过，会误报（`agent.ActionModel` 在多动作时是
           `RootModel[Union[...]]` 包装，`model_fields` 只有 `{'root'}`）。
           详见 `actions/guard_gate.verify_notice_round_trip` 的说明。
+
+        ★ 两个检查的**失败后果不同，所以两个都要**：
+          · `verify_notice_round_trip` —— 拒绝路径坏了：护栏看起来在跑，动作照跑。
+          · `verify_stop_callback`   —— 硬停路径坏了：每步都报错，run 一步都跑不完。
+          它们是两条独立的路径，坏掉的表现也完全不同，所以不能用一个代表另一个。
+          后者是 live 验收跑出来的实锤，之前只有前者。
         """
         self.bind_action_model(agent)
         verify_notice_round_trip(self._action_model)
+        await self.verify_stop_callback()
 
         # 顺带把"动作模型里到底有哪些动作"打出来 —— 库改版时这是第一眼要看的东西。
         fields = compat.action_model_fields(self._action_model)
@@ -337,15 +345,40 @@ class GuardrailInterceptor:
             return None
 
     # ── 硬停：交给库自己的停机通道 ────────────────────────
-    def should_stop(self) -> bool:
-        """给 `Agent(register_should_stop_callback=...)` 用。**无参数**。
+    async def should_stop(self) -> bool:
+        """给 `Agent(register_should_stop_callback=...)` 用。**无参数，但必须 async**。
 
+        ★★★ 这个 `async` 不是风格选择，是库的硬要求，而且**写错了不会立刻报错**：
+          `Agent.__init__` 的注解是（service.py:165）
+
+              register_should_stop_callback: Callable[[], Awaitable[bool]] | None
+
+          调用点是 `if await self.register_should_stop_callback():`（service.py:1018）。
+          同步版本返回一个 `bool`，`await bool` 抛
+          `TypeError: 'bool' object can't be awaited`。
+
+          ⚠️ 为什么这个坑特别隐蔽 —— 它被包在 `_handle_step_error` 里：
+            每一次 `_check_stop_or_pause()`（service.py:1109 / 1203 / 1209 / 2773 四处）
+            都变成一个**步进错误**，而 `_check_stop_or_pause` 每步至少被调两次。
+            所以表现是 `Result failed 1/6 times: 'bool' object can't be awaited`
+            刷屏 → 连续失败到上限 → run 结束，**0 步、0 行数据**，
+            而报错文本里完全看不出"是我们的回调"—— 它只说有个 bool 没法 await。
+
+        为什么单独说"四个回调里只有这一个"：
+          `register_new_step_callback`（service.py:164）和 `register_done_callback`
+          的注解都显式写了 `Awaitable[X] | X` **两种都收**，
+          只有本回调和 `register_external_agent_status_raise_error_callback`
+          是纯 `Awaitable`。所以"前两个同步写也能跑"这件事，
+          会把人骗到第三个上。
+
+        ★ `verify_stop_callback()` 在开跑前 await 一次本方法 ——
+          这类错误必须在启动期就死，而不是跑到第 6 秒才以一句无关报错的形式出现。
         ★ 为什么硬停不用"注入一个 done 动作"来实现：见 `on_new_step` 里的长注释
           （done 的参数模型随 output_model 变，会在最需要可靠的那一刻校验失败）。
 
         ★ 为什么用这个回调而不是自己抛异常：
           库在 `_check_stop_or_pause`（`service.py:1013-1021`）里已经实现了
-          "置 `state.stopped` + 抛 InterruptedError`这套完整语义，而
+          "置 `state.stopped` + 抛 InterruptedError"这套完整语义，而
           `step()` 的 except 对 InterruptedError 有专门分支（只打 warning，
           不当错误处理），`run()` 的循环顶部也会读 `state.stopped` 干净退出。
           自己抛异常要重新踩一遍这些分支，而它们是库的内部约定。
@@ -355,6 +388,43 @@ class GuardrailInterceptor:
           而 `_execute_actions` 还在更后面 —— 所以这一步的动作一个都不会执行。
         """
         return self.stop_reason is not None
+
+    async def verify_stop_callback(self) -> None:
+        """开跑前**真的 await 一次**本拦截器的停机回调。接线不对就当场死。
+
+        ★★ 为什么是"真的 await"而不是查 `inspect.iscoroutinefunction`：
+          查签名只能证明"它现在是 async"，证明不了"库会怎么调它"。
+          而这次的 bug 恰恰是**我们的形状**和**库的调用方式**对不上 ——
+          真正的契约是"库会 await 它"，那就 await 一次。
+
+        ★ 为什么这个检查必须存在（它是这次 live 验收抓到的实锤）：
+          同步版 `should_stop` 让每一次 `_check_stop_or_pause()` 都抛
+          `TypeError: 'bool' object can't be awaited`，被 `_handle_step_error`
+          当成步进错误吞掉。结果是：护栏的**硬停永远不生效**，
+          同时 run 每步都失败、连续 5 次后停下，0 步 0 行，
+          而报错文本指向的是一个 bool —— 没人会顺着它找到这里。
+
+          ⚠️ 更坏的一层：硬停失灵是**静默**的。护栏拦得住单个动作（那条路径不经过
+            这个回调），所以"护栏在工作"的假象成立；只有"连续被拦到上限要硬停"
+            这一条路径是坏的 —— 而那正是最后一道保险。
+        """
+        outcome = self.should_stop()
+        if not inspect.isawaitable(outcome):
+            raise RuntimeError(
+                f"停机回调必须是 async 的：`should_stop()` 返回了 "
+                f"{type(outcome).__name__}，而库会 `await` 它的返回值"
+                f"（agent/service.py:1018；注解见 service.py:165 的 "
+                f"`Callable[[], Awaitable[bool]]`）。"
+                f"同步版本的表现是每步都抛 'bool' object can't be awaited，"
+                f"既让硬停失效、又让整个 run 一步都跑不完。"
+            )
+        value = await outcome
+        if not isinstance(value, bool):
+            raise RuntimeError(
+                f"停机回调必须返回 bool，实际是 {type(value).__name__}。"
+                f"库把它当条件用（service.py:1018），非 bool 的真值语义会让"
+                f"停机时机变得不可预期。"
+            )
 
     # ── 交接 ──────────────────────────────────────────────
     def bind_action_model(self, agent: Any) -> None:

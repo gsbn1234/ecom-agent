@@ -799,3 +799,154 @@ e2e，其中包括护栏那条 `/goods/delete/` 的 HTTP 层断言 —— 那是
 这句话今天是**真的**（run `35117778593` / `35118896356` / `35120305012` 三轮实测），
 但只要 browser job 开始无声腐烂（例如库升级破掉一条未文档化契约），
 CI 会一直绿，而那句 README **会在没人知道的情况下变成假的**。
+
+---
+
+# Phase 3 live 验收：一次真 token 运行带回的两条库事实（2026-09-17）
+
+验收动作：`main.py run tasks/books_demo.yaml --approver deny`
+（真网络 `books.toscrape.com` + 真 DeepSeek token + 真浏览器）。
+
+这一节存在的理由：**上面所有结论都是"零 token"环境里得到的，而下面第一条
+只有真跑一次才会出现** —— 它不在任何单元测试的覆盖范围里，
+因为没有任何测试碰过那个回调。
+
+## 结论 1：`register_should_stop_callback` 是四个回调里**唯一**只收 async 的（已修）
+
+### 现象
+
+第一次 live 运行，0 步、0 行，退出码 1：
+
+```
+❌ Result failed 1/6 times: 'bool' object can't be awaited
+❌ Result failed 2/6 times: 'bool' object can't be awaited
+...
+❌ Result failed 6/6 times: 'bool' object can't be awaited
+❌ Stopping due to 5 consecutive failures
+```
+
+报错里**没有一个字**指向我们的代码。它说的是"有个 bool 没法 await"。
+
+### 逐字证据
+
+```
+$ uv run python -c "import inspect; from browser_use import Agent; \
+    print(inspect.signature(Agent.__init__).parameters['register_should_stop_callback'].annotation)"
+collections.abc.Callable[[], collections.abc.Awaitable[bool]] | None
+```
+
+也只有这一条：
+
+| 回调 | 0.13.10 的注解 | 同步能跑吗 |
+|---|---|---|
+| `register_new_step_callback` | `Callable[..., None] \| Callable[..., Awaitable[None]]` | **能** |
+| `register_done_callback` | `Callable[..., Awaitable[None]] \| Callable[..., None]` | **能** |
+| `register_should_stop_callback` | `Callable[[], Awaitable[bool]] \| None` | **不能** |
+| `register_external_agent_status_raise_error_callback` | `Callable[[], Awaitable[bool]] \| None` | **不能** |
+
+调用点：`if await self.register_should_stop_callback():`（`agent/service.py:1018`）。
+`await True` → `TypeError: 'bool' object can't be awaited`。
+
+### 为什么这个坑特别隐蔽（三层，逐层加重）
+
+1. **解析层**：库里另外两个回调**两种都收**。所以"回调写成同步的也能跑"
+   这条经验是先被建立起来、再在这里失效的 —— 这是最容易踩的形状。
+2. **吞异常层**：`_check_stop_or_pause` 在 `service.py` 的 **1109 / 1203 / 1209 / 2773
+   四处**被调，每步至少调两次。它抛的异常走 `step()` 的 except →
+   `_handle_step_error` → 变成一条**步进错误**。于是表现是"每步都失败"，
+   而不是"停机回调坏了"。
+3. **假象层（最坏的一层）**：护栏拦单个动作的路径**不经过这个回调**
+   （那条路走 `on_new_step` + `guard_notice`），所以"护栏在工作"的假象成立。
+   真正坏掉的是**连续被拦到上限后的硬停** —— 那是最后一道保险，
+   而它**静默失效**。
+
+### 为什么离线套件没抓到
+
+**没有任何测试碰过这个回调。** runner 只是把它当一个函数对象传给 `Agent`，
+而"传进去"和"库会怎么调它"是两件不同的事。
+`tests/test_runner_offline.py` 覆盖了增长闸门、S2-4、LLM 账、落库、CLI，
+唯独这一条路径在 I 节之前是完全空的。
+
+### 修法与守卫
+
+- `GuardrailInterceptor.should_stop` → `async def`。
+- 新增 `GuardrailInterceptor.verify_stop_callback()`，由 `check_wiring` 在**开跑前**
+  `await` 一次。**为什么是"真的 await"而不是查 `iscoroutinefunction`**：
+  查签名只能证明"它现在是 async"，证明不了"库会怎么调它" ——
+  而这次的 bug 恰恰是**我们的形状**和**库的调用方式**对不上，真正的契约是"库会 await 它"。
+- `check_wiring` 因此变成 `async`（runner 侧加 `await`）。
+- 守卫共 5 条（`tests/test_runner_offline.py` I 节）+ 1 条版本哨兵
+  （`tests/test_compat.py::test_should_stop_callback_is_async_only`，守"这个不对称还在不在"）。
+  其中两条是对照实验：同步版**必须**被启动期抓住；正常版**必须**通过
+  （只有前者是"永远失败的检查"，会被人注释掉；只有后者是"永远通过的检查"，
+  等于没有检查 —— 两个都要）。
+
+### 通用经验（比这个 bug 本身值钱）
+
+> **回调的失败形态是「契约在调用点，不在签名处」。**
+> 我们传的是一个函数对象；库拿它怎么用（await 不 await、传几个参数、
+> 返回值怎么解释）**只在库的调用点上**。所以自检必须走**真实的调用形状**
+> —— 这一次的教训具体写成一句：`await 一下自己`，比读一百遍签名有用。
+
+## 结论 2：库对 DeepSeek 的 `use_vision` 警告是**无条件**打的（假警报，未改库）
+
+### 现象
+
+YAML 里明写 `agent: use_vision: false`，编译产物也确认带上了
+（`compiled.agent_kwargs == {'use_vision': False, 'max_actions_per_step': 2, 'max_failures': 5}`），
+但每次 run 都打：
+
+```
+⚠️ [Agent] DeepSeek models do not support use_vision=True yet. Setting use_vision=False for now...
+```
+
+### 根因
+
+```
+474| # TODO: move this logic to the LLMs
+475| # Handle users trying to use use_vision=True with DeepSeek models
+476| if 'deepseek' in self.llm.model.lower():
+477|     self.logger.warning('⚠️ DeepSeek models do not support use_vision=True yet. ...')
+478|     self.settings.use_vision = False
+```
+
+注释写的是"处理**把 use_vision 设成 True** 的用户"，但 `if` 里**只看模型名**，
+根本没读 `use_vision`。所以无论调用方设了什么，这条警告都会打。
+
+### 处置：不修库，记在这里
+
+按本项目自己的标准（"假警报比不报警更坏：它训练人忽略这个检查"），
+这属于该记下来的一类。但**库源码只读**，而且实际影响是"每次 run 多一行噪音"，
+改它的收益不值得破例。**记在这里是为了下一次读到它的人不要花时间去查我们的配置**
+—— 那正是它最容易造成的浪费。
+
+## 这次运行顺带验证了什么（真 LLM 下的端到端）
+
+`runs/20260917T050218+0000-4ec444`，退出码 0：
+
+| 项 | 实测值 |
+|---|---|
+| 状态 | `completed` / `parse_status=ok` |
+| 采集行数 | 5（真实书名 + 真实价格） |
+| 步数 / LLM 调用 | 6 / 7（步进 6 + 裁判 1，`other_calls=0`） |
+| 产物 | `run.json` `steps.jsonl` `result.json` `report.html` `screenshots/` 全在 |
+| `unsafe_auto_approved` | `False` |
+
+三条值得记的：
+
+1. **护栏的拒绝→改道在真 LLM 上成立**。steps 2–5 的每个动作都落到
+   `default_decision=confirm` → auto-deny → 被换成 `guard_notice`（`actions=['guard_notice']`）
+   → LLM 没有重复尝试，第 6 步直接 `done`。**这正是选"替换而不是删除"的理由的实证**：
+   删掉的话 LLM 会以为自己没下指令而重试。
+2. **`same_frame_steps=[3,4,5,6]` 是正确的诊断**，不是误报 ——
+   页面确实一直没变，因为那几步的动作一个都没执行。
+   这条"截图 sha 相同 ⇒ 页面未变化"的信号第一次在真实数据上被验证。
+3. **`sanity_flags` 把 5 行全标了 `goods_id_not_numeric`** ——
+   这是复用 `pdd.ProductRowList` 的**预期后果**（books 没有 goods_id），
+   而"标记而不删除"的设计正好把它显式留了下来。见 `books_demo.yaml` 第 37–41 行的注释。
+
+另有一条**诚实的缺口**：`prompt_tokens` / `completion_tokens` 都是 0，
+即 DeepSeek 这条链路上的 token 用量没被 `CountingLLM` 捕到
+（`library_calls=0`）。`total_calls` 是可信的（那是我们自己的计数器），
+所以 LLM **次数**的账是准的、**用量**的账是空的。
+Phase 4 若不涉及成本统计可以不动，但**不要**把 0 当成"没花钱"读。

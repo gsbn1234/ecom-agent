@@ -59,6 +59,41 @@ def test_run_still_accepts(param):
     assert param in inspect.signature(Agent.run).parameters
 
 
+def test_should_stop_callback_is_async_only():
+    """★★ 四个回调里**只有它**不接受同步函数 —— 这是个会静默炸的坑。
+
+    0.13.10 的实际注解（`inspect.signature` 解析后）：
+
+        register_new_step_callback   Callable[..., None] | Callable[..., Awaitable[None]]
+        register_done_callback       Callable[..., Awaitable[None]] | Callable[..., None]
+        register_should_stop_callback            Callable[[], Awaitable[bool]] | None   ← 只有 Awaitable
+        register_external_agent_status_raise_error_callback
+                                                 Callable[[], Awaitable[bool]] | None
+
+    前两个**两种都收**，所以"回调写成同步的也能跑"这个经验会被建立起来，
+    然后在第三个上失效。而失效的表现（`'bool' object can't be awaited`）
+    完全指不到这里 —— 它被 `_handle_step_error` 吞成一条步进错误，
+    每步至少两次（`_check_stop_or_pause` 在 service.py:1109/1203/1209/2773
+    共四处被调），于是 run 一步都跑不完，日志里只有刷屏的无关报错。
+
+    ★ 所以这条哨兵守的是"这个不对称还在不在"：
+      哪天库把同步形态也加进注解里，这里会红 —— 那时
+      `interceptor.verify_stop_callback` 的严格性就可以放宽了。
+      在那之前，它必须一直严。
+    """
+    annotation = str(inspect.signature(Agent.__init__).parameters[
+        "register_should_stop_callback"
+    ].annotation)
+    assert "Awaitable[bool]" in annotation, (
+        f"停机回调的注解形状变了：{annotation} —— "
+        "请核对 interceptor.should_stop 的 async 是否仍然必要"
+    )
+    assert "Callable[[], bool]" not in annotation, (
+        "库开始接受同步形态的停机回调了 —— "
+        "interceptor.verify_stop_callback 的启动期门禁可以放宽（但没必要）"
+    )
+
+
 def test_action_decorator_signature():
     """★ 断言的是【真实的装饰器】Registry.action，不是 Tools.action。
 

@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -913,3 +914,114 @@ def test_unknown_status_is_not_treated_as_success():
         rows_collected=0, record=RunRecord(run_id="r", task_id="t"),
     )
     assert _exit_code(outcome) == 1
+
+
+# ── I. 停机回调的 await 契约（live 验收抓到的实锤）──────────
+#
+# ★★ 这一节的来源不是设计，是一次真实失败的运行记录：
+#
+#     ❌ Result failed 1/6 times: 'bool' object can't be awaited
+#     ❌ Stopping due to 5 consecutive failures
+#     步数: 0    采集行数: 0
+#
+#   根因：`should_stop` 当时是同步方法，而库的唯一注解是
+#   `Callable[[], Awaitable[bool]]`（agent/service.py:165），
+#   调用点是 `if await self.register_should_stop_callback():`（1018）。
+#   `await bool` 抛 TypeError，被 `_handle_step_error` 当成步进错误吞掉。
+#
+#   为什么离线套件当时没抓到，值得记下来：**没有任何测试碰过这个回调**。
+#   它在 runner 里只是被当作一个函数对象传给 Agent，
+#   而"传进去"和"库会怎么调它"是两件事。
+#
+#   所以下面这几条不是"补一个漏测"，是补上一条**从没被走过**的路径。
+
+
+class _SyncStopInterceptor(GuardrailInterceptor):
+    """把 `should_stop` 退回同步版 —— 复现那次 live 失败的确切形状。
+
+    ★ 刻意用**子类覆盖**而不是 monkeypatch 实例属性：
+      我们要验的是"这个方法的形状不对时，启动自检会不会失败"，
+      而子类覆盖正是真实代码出问题时的样子（有人把 `async` 删掉就是这个）。
+      monkeypatch 一个实例属性反而绕开了"方法"这层，验的东西就偏了。
+    """
+
+    def should_stop(self) -> bool:  # type: ignore[override]  # 故意写错
+        return self.stop_reason is not None
+
+
+def _interceptor_with_stop(tmp_path, books, cls=GuardrailInterceptor):
+    return cls(
+        GuardrailPolicy(books.spec.guardrails),
+        None,
+        recorder=make_recorder(tmp_path),
+        run_id="test-run",
+    )
+
+
+def test_stop_callback_is_awaitable_and_returns_bool(tmp_path, books):
+    """正例：我们的回调能被 await，返回值是真的 bool。"""
+    interceptor = _interceptor_with_stop(tmp_path, books)
+    assert asyncio.run(interceptor.verify_stop_callback()) is None
+    assert asyncio.run(interceptor.should_stop()) is False, (
+        "没触发硬停时必须返回 False —— 库把它当条件用，"
+        "非 bool 的真值语义会让停机时机变得不可预期"
+    )
+
+
+def test_control_experiment_sync_stop_callback_is_caught_at_startup(tmp_path, books):
+    """★★ 对照实验：同步版必须被**启动期**抓住，而不是跑到第 6 秒。
+
+      没有这一条，上面那条"检查通过"就可能是因为别的原因通过的
+      （比如 `isawaitable` 永远为真），而我们就不知道自己在验什么。
+      一个永远通过的检查等于没有检查 —— 而且更坏，因为它让人以为被管住了。
+    """
+    interceptor = _interceptor_with_stop(tmp_path, books, cls=_SyncStopInterceptor)
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(interceptor.verify_stop_callback())
+
+    message = str(ei.value)
+    assert "should_stop" in message, "报错必须点名是哪个回调"
+    assert "Awaitable" in message, "要说出真正的契约：库会 await 它"
+    assert "bool" in message, "要带上实际拿到的类型，否则排查的人不知道差异在哪"
+
+
+def test_stop_callback_still_reports_a_stop_when_one_is_set(tmp_path, books):
+    """★ 自检用的那一次 await **不能有副作用** —— 它读完就得走。
+
+      否则"启动自检"本身会把这个拦截器变成"已经硬停过"的状态，
+      于是 run 从第一步就不执行任何动作，而那看起来像护栏正常工作。
+    """
+    interceptor = _interceptor_with_stop(tmp_path, books)
+    interceptor.stop_reason = "（测试）假装已经决定硬停"
+    assert asyncio.run(interceptor.should_stop()) is True
+    # 再 await 一次，值不变 —— 说明它是纯读，不是一次性消费
+    assert asyncio.run(interceptor.should_stop()) is True
+
+
+def test_check_wiring_actually_calls_the_stop_check(tmp_path, books):
+    """★★ 证明 `check_wiring` 真的把停机自检**接上了**。
+
+      这条比上面几条都容易漏：`verify_stop_callback` 写得再对，
+      只要没有人在启动期调它，它就只是一个没人调的方法 ——
+      而"没人调的正确检查"和"没有检查"在运行时的表现完全一样。
+
+      ⚠️ 假 agent 只给 `ActionModel` 一个属性，因为 `check_wiring` 只读它
+        （真值是 `self.tools.registry.create_action_model()`，service.py:783）。
+        做成最小形状是刻意的：接线对 agent 的依赖面在测试里是可数的。
+    """
+    interceptor = _interceptor_with_stop(tmp_path, books, cls=_SyncStopInterceptor)
+    agent = type("A", (), {"ActionModel": _tools().registry.create_action_model()})()
+
+    with pytest.raises(RuntimeError, match="should_stop"):
+        asyncio.run(interceptor.check_wiring(agent))
+
+
+def test_check_wiring_passes_for_the_real_interceptor(tmp_path, books):
+    """★ 反面对照：正常形状下 `check_wiring` 必须通过。
+
+      两条合起来证明这个门禁是"会失败的检查"，而不是"永远失败的检查"
+      —— 后者会让每次 run 都起不来，然后被人注释掉。
+    """
+    interceptor = _interceptor_with_stop(tmp_path, books)
+    agent = type("A", (), {"ActionModel": _tools().registry.create_action_model()})()
+    assert asyncio.run(interceptor.check_wiring(agent)) is None
