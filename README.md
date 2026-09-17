@@ -42,8 +42,14 @@ cd ecom-agent
 uv venv && uv pip install -e ".[dev]"
 
 cp .env.example .env      # 填 DEEPSEEK_API_KEY
-uv run pytest             # 全离线，零 token，应当全绿
+uv run pytest -m "not needs_browser"   # 离线 394 条，零 token 零网络，应当全绿
+uv run pytest                          # 全部 411 条（含 17 条真浏览器，会真的开 Chrome）
 ```
+
+> ⚠️ **`uv run pytest` 默认包含 `needs_browser`** —— 想"零 token 零网络"地跑一遍，
+> 必须显式加 `-m "not needs_browser"`。这不是排版讲究：不加的话，`pytest` 会去启动
+> 真浏览器，而本机没配好 Chrome 时它**报的错和"代码写错了"长得一模一样**。
+> 这个项目的每个命令都尽量让它"默认行为 == 你以为的行为"，这一条是例外，所以写在这里。
 
 跑通一个只读任务（需要真实 key）：
 
