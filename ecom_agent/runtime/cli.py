@@ -29,6 +29,7 @@ from ecom_agent.config import CHROME_PATH, DB_PATH, HEADLESS, RUNS_DIR, TASKS_DI
 from ecom_agent.dsl.compiler import CompiledTask, ParamError, compile_task
 from ecom_agent.dsl.loader import TaskLoadError, load_task
 from ecom_agent.observability.models import BLOCKED, COMPLETED, FAILED
+from ecom_agent.runtime.loginstate import LOGGED_IN, LOGIN_PAGE, NOT_PROBED, UNKNOWN
 from ecom_agent.runtime.profile import check_profile, describe_ready
 from ecom_agent.runtime.runner import PreflightError, RunOutcome, run_task
 
@@ -204,13 +205,34 @@ def cmd_runs(args: argparse.Namespace) -> int:
         print("库里还没有 run 记录")
         return EXIT_OK
 
-    print(f"{'run_id':<30} {'任务':<24} {'状态':<10} {'解析':<15} {'行':>4}  开始时间")
+    print(
+        f"{'run_id':<30} {'任务':<24} {'状态':<10} {'解析':<15} {'登录态':<12} {'行':>4}  开始时间"
+    )
     for r in rows:
         print(
             f"{r['run_id']:<30} {r['task_id']:<24} {r['status']:<10} "
-            f"{r['parse_status']:<15} {r['rows_collected']:>4}  {r['started_at']}"
+            f"{r['parse_status']:<15} {_login_cell(r.get('login_state')):<12} "
+            f"{r['rows_collected']:>4}  {r['started_at']}"
         )
     return EXIT_OK
+
+
+def _login_cell(value: str | None) -> str:
+    """把登录态压成一个窄列能放下的说法。
+
+    ★ 这一列存在的理由和报告里那一行是同一个：**「零行」的两种原因在
+      其余所有列里长得一模一样**。第一次在库里看到一排 `empty / 0` 的时候，
+      没有它就完全不知道该去查风控、查解析、还是去扫码重新登录。
+
+    ★ `""`（没探）显示成 `-` 而不是"未知"：这个任务不需要登录态，
+      说"未知"会让人以为出了问题，然后去查一件本来没发生的事。
+    """
+    return {
+        NOT_PROBED: "-",
+        LOGGED_IN: "已登录",
+        LOGIN_PAGE: "⚠️登录页",
+        UNKNOWN: "看不清",
+    }.get(value or "", value or "-")
 
 
 def cmd_tasks(args: argparse.Namespace) -> int:

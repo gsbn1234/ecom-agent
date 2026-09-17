@@ -36,8 +36,17 @@ SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 #   "在我机器上是好的"（我的库是新键的）。
 _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("empty_selector_map_steps_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("login_state", "TEXT NOT NULL DEFAULT ''"),
+    ("login_state_reason", "TEXT NOT NULL DEFAULT ''"),
+    ("login_state_url", "TEXT NOT NULL DEFAULT ''"),
 )
-"""★ empty_selector_map_steps_json —— S2-4 探测器的落库列。见 RunRecord 的同名字段。"""
+"""★ empty_selector_map_steps_json —— S2-4 探测器的落库列。见 RunRecord 的同名字段。
+
+★ 三条 login_state_* —— "这次到底是登进去没有"的落库列。见 RunRecord.login_state。
+  ⚠️ 老库（Phase 6 之前建的、以及真站点首跑那个 `runs/ecom_agent.db`）**没有**这三列，
+  而那个库是审计资产 —— 只能加列，不能重建。这就是 `_migrate()` 存在的理由：
+  默认值 `''` 对老行是**诚实**的（那时确实没探过），不是"填个假值糊过去"。
+"""
 
 
 class Repository:
@@ -155,6 +164,7 @@ class Repository:
                     start_url, params_json, compiled_task_text, guardrail_policy_json,
                     steps, llm_json, parse_status, rows_collected,
                     sanity_flags_json, result_raw,
+                    login_state, login_state_reason, login_state_url,
                     screenshot_count, same_frame_steps_json, snapshot_missing_steps_json,
                     snapshot_overwrites, empty_selector_map_steps_json,
                     redaction_counts_json, unsafe_auto_approved,
@@ -166,6 +176,7 @@ class Repository:
                     :start_url, :params_json, :compiled_task_text, :guardrail_policy_json,
                     :steps, :llm_json, :parse_status, :rows_collected,
                     :sanity_flags_json, :result_raw,
+                    :login_state, :login_state_reason, :login_state_url,
                     :screenshot_count, :same_frame_steps_json, :snapshot_missing_steps_json,
                     :snapshot_overwrites, :empty_selector_map_steps_json,
                     :redaction_counts_json, :unsafe_auto_approved,
@@ -198,6 +209,11 @@ class Repository:
                     "rows_collected": payload["rows_collected"],
                     "sanity_flags_json": _j(payload["sanity_flags"]),
                     "result_raw": payload["result_raw"],
+                    # ★ 登录态三列。★ 注意它取自 RunRecord 而不是调用方 ——
+                    #   "有没有登录"是 run 自己观察到的事实，不该由谁来转述。
+                    "login_state": payload["login_state"],
+                    "login_state_reason": payload["login_state_reason"],
+                    "login_state_url": payload["login_state_url"],
                     "screenshot_count": payload["screenshot_count"],
                     "same_frame_steps_json": _j(payload["same_frame_steps"]),
                     "snapshot_missing_steps_json": _j(payload["snapshot_missing_steps"]),
@@ -258,7 +274,7 @@ class Repository:
         纯按时间排序，所以这里不需要额外索引：runs 表本身不会大到需要它。"""
         rows = self.conn.execute(
             "SELECT run_id, task_id, task_name, status, started_at, duration_s, "
-            "parse_status, rows_collected FROM runs ORDER BY started_at DESC LIMIT ?",
+            "parse_status, rows_collected, login_state FROM runs ORDER BY started_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]

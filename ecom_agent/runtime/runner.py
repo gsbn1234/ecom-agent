@@ -47,6 +47,7 @@ from ecom_agent.observability.models import (
 from ecom_agent.observability.recorder import RunRecorder, new_run_id
 from ecom_agent.observability.redact import Redactor
 from ecom_agent.observability.report import render_report, write_report
+from ecom_agent.runtime import loginstate
 from ecom_agent.sites.pinduoduo.output_models import ParseStatus
 
 logger = logging.getLogger(__name__)
@@ -358,6 +359,17 @@ class TaskRunner:
         self._started_at = now_iso()
         self.recorder: RunRecorder | None = None
 
+        self.login_state = loginstate.LoginState()
+        """导航到起点之后**实测**到的登录态（`runtime/loginstate.py`）。
+
+        ★★ 这是产物里唯一能分辨「零行」那两种原因的东西。没有它，"页面正常但没数据"
+          和"登录态失效被弹到登录页"在 run.json / 报告 / 退出码里**完全一样**
+          （都是 completed / empty / 0 行 / 报告齐全），结论就只能靠读 LLM 写的那句
+          中文 note —— 那是模型的措辞，不是机制。Phase 6 真站点首跑就是这么撞出来的。
+        ★ 默认值是 `NOT_PROBED`（空串），与 `UNKNOWN` 分开：前者是"这个任务不需要
+          登录态"，后者是"探了但看不清"。两种沉默的处置相反，不能压成一个值。
+        """
+
     # ── 事件 ──────────────────────────────────────────────
     def _publish(self, type_: str, data: dict[str, Any]) -> None:
         """往实时通道发一条。没有总线时静默跳过。
@@ -641,6 +653,17 @@ class TaskRunner:
         async with browser_session(
             self.compiled, warmup_url=self.spec.start_url
         ) as session:
+            # ★★ 导航到起点之后**立刻**记下"这一页到底是不是登录页"。
+            #   这是产物里唯一能分辨「零行」两种原因的字段 —— 而它必须在**烧掉任何
+            #   token 之前**拿到：任务文本里写着"遇登录页立刻停止并汇报"，
+            #   所以登录态失效时跑下去注定零行，此刻是唯一还来得及改主意的时刻。
+            #   ⚠️ 只在 requires_login 的任务上探：mock 任务的页面上根本没有那些词，
+            #   探了只会得到 unknown —— 那就是"每次都唠叨一遍"的噪声，
+            #   而噪声会把这条**唯一能省下一次白跑**的话淹掉。
+            if self.spec.requires_login:
+                self.login_state = await loginstate.probe(session)
+                self._note_login_state()
+
             agent = Agent(
                 task=self.compiled.task_text,
                 llm=llm,
@@ -683,6 +706,32 @@ class TaskRunner:
                 blocked=interceptor.stop_reason is not None,
                 stop_reason=interceptor.stop_reason or "",
             )
+
+    def _note_login_state(self) -> None:
+        """把**实测**登录态说给人听。
+
+        ★ 为什么要在日志里说话，而不是只落进 run.json：报告是**跑完之后**才看的，
+          而这句话的价值在于"现在还来得及 Ctrl-C"。落在登录页的 run 注定零行
+          （任务文本让它规矩地停下汇报），与其事后对着一份漂亮的空报告猜原因，
+          不如事前说一句。这也正是 `devtools/login_pdd.py` 复核的意义所在 ——
+          它保证标记只在真的能用时才写下，但 cookie 会过期，标记拦不住时间。
+        """
+        state = self.login_state
+        if state.is_login_page:
+            logger.warning(
+                "实测登录态：落在**登录页**上 —— 本次 run 将零行，而且**不是风控**。依据：%s",
+                state.reason,
+            )
+            logger.warning(
+                "修复：uv run python devtools/login_pdd.py"
+                "（复核通过后它会打印该写进 .env 的那一行）"
+            )
+            return
+        label = {
+            loginstate.LOGGED_IN: "已登录",
+            loginstate.UNKNOWN: "判不出来（只知道不是登录页）",
+        }.get(state.verdict, state.verdict)
+        logger.info("实测登录态：%s —— %s", label, state.reason)
 
     def _make_step_hook(self, recorder: RunRecorder, interceptor: GuardrailInterceptor):
         """造 `on_step_end` 钩子。
@@ -856,6 +905,14 @@ class TaskRunner:
             rows_collected=_row_count(structured),
             sanity_flags=flags,
             result_raw=raw,
+            # ★★ 这次 run **实测**到的登录态（不是配置的那个 profile）。
+            #   它是产物里唯一能分辨「零行」两种原因的东西：店里没数据 vs
+            #   落在登录页上按规矩停下汇报 —— 这两者在别的字段里一模一样。
+            #   没探过的任务（requires_login=False）保持 NOT_PROBED（空串），
+            #   与"探了但看不清"（unknown）分开：两种沉默的处置完全相反。
+            login_state=self.login_state.verdict,
+            login_state_reason=self.login_state.reason,
+            login_state_url=self.login_state.url,
             # ★ 调试后门用过的痕迹。取自 approver 的类属性 ——
             #   没有这个字段的话，"我调试时关掉审批跑过一次"和"这次真的没人需要审批"
             #   在记录里长得一模一样，而前者是必须在真实场景里被发现的。

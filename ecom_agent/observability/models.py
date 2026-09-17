@@ -17,6 +17,17 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ecom_agent.runtime.loginstate import NOT_PROBED
+"""★ 这一行看着像"下层 import 上层"，其实不是：`loginstate` 是**叶子模块** ——
+  它只有 asyncio / logging / dataclasses，碰不到 browser_use，也不碰 IO。
+  （`runtime/__init__.py` 里那句"只有 browser.py 和 runner.py import browser_use"
+  仍然成立，这里 import 的只是一段纯判定逻辑。）
+
+★ 为什么宁可跨目录也要 import 这个常量，而不是在这里写个字面量 `""`：
+  登录态的取值集合是**一处定义**的东西。在这儿再写一遍 `""`，就又多了一个
+  "同一个真相存在两个地方"的口子 —— 而那正是这个字段本身要消灭的那类缺陷
+  （某个通道从没发过它 / 两个地方各写各的）。"""
+
 
 def now_iso() -> str:
     """统一的时间戳格式（UTC，秒精度）。
@@ -394,6 +405,41 @@ class RunRecord(BaseModel):
 
     result_raw: str = ""
     """LLM 产出的原始 JSON。quarantine 时 products 表零行，但这份原文留着。"""
+
+    # ── 这次 run 实际看到的登录态 ──────────────────────────
+    login_state: str = NOT_PROBED
+    """★★ 导航到任务起点之后**实测**到的登录态：`logged_in` / `login_page` /
+    `unknown` / `""`（压根没探）。取值定义在 `runtime/loginstate.py`。
+
+    ★ 为什么这个字段必须存在（Phase 6 真站点首跑撞出来的，不是推演）：
+      一次零行的 run 可能是「店里本来就没数据」，也可能是「登录态失效、agent
+      落在登录页上，于是按任务文本规规矩矩地停下汇报」。这两件事在**其他所有
+      产物里长得一模一样** —— `status=completed`、`parse_status=empty`、
+      退出码 0、报告齐全、截图也有。当时唯一能分辨它们的，是读 LLM 写的那句
+      中文 note，或者人肉去看截图 —— 也就是说结论靠模型的措辞，不靠机制。
+      换个措辞、或者换个不爱写 note 的模型，就又回到"看不出为什么"。
+
+    ★ 记的是**观察到的**事实，不是**配置的**事实 —— 这个区别是全部意义所在。
+      cookie 过期时，配置里照样写着那个 profile 路径，而 run 照样停在登录页。
+      所以"记下配了哪个 profile"回答不了"这次到底登进去没有"。
+
+    ⚠️ `""` 与 `"unknown"` **必须分开**：前者是"这个任务不需要登录态"（一切正常），
+      后者是"探了但看不清"（需要人去看一眼）。两种沉默的处置完全相反。
+    """
+
+    login_state_reason: str = ""
+    """判定依据（命中了哪些词、看的是哪个 URL）。
+
+    ★ 要**原样给人看**：判错的时候，它是唯一能让人快速分清"是脚本看错了"
+      还是"真的没登录"的线索。所以它自己就得能解释结论。
+    """
+
+    login_state_url: str = ""
+    """探测时**实际落到**的那个 URL —— 跳转、重定向之后的那一个。
+
+    ★ 和配置里的 `start_url` 不是一回事：两者不同恰恰说明发生了跳转，
+      而那正是"落在登录页"最常见的形态。
+    """
 
     # ── 观测自身的健康度 ──────────────────────────────────
     screenshot_count: int = 0

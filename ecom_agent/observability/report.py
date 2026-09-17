@@ -27,6 +27,12 @@ from ecom_agent.observability.models import (
     RunRecord,
     StepRecord,
 )
+from ecom_agent.runtime.loginstate import (
+    LOGGED_IN,
+    LOGIN_PAGE,
+    NOT_PROBED,
+    UNKNOWN,
+)
 
 # 状态 → 颜色。★ 用显式映射而不是 if 链：加一个新状态时忘了改这里，
 # 报告会显示成"灰的"，那看起来像"没状态"而不是"渲染漏了"。
@@ -53,6 +59,57 @@ def _badge(text: str, color: str, bg: str) -> str:
 def _stat_row(label: str, value: Any, note: str = "") -> str:
     n = f'<div class="note">{esc(note)}</div>' if note else ""
     return f'<tr><th>{esc(label)}</th><td>{esc(value)}{n}</td></tr>'
+
+
+# 登录态 → 给人看的说法。★ 用显式映射而不是 if 链：加一个新取值时忘了改这里，
+# 会显示成原始枚举（`unknown`），那看起来像"渲染漏了"而不是"我们看不清"。
+_LOGIN_LABEL = {
+    LOGGED_IN: "已登录",
+    LOGIN_PAGE: "⚠️ 落在登录页",
+    UNKNOWN: "看不清（探了，但两边都不像）",
+}
+
+
+def _login_state_row(record: RunRecord) -> str:
+    """登录态那一行。**放在『可信度』的第一行**，因为它能一句话否掉整份报告。
+
+    ★★ 这一行的存在理由：一次零行的 run，「店里没数据」和「落在登录页上按规矩
+      停下汇报」在**别的所有字段里长得一模一样**（status=completed、
+      parse_status=empty、退出码 0、截图齐全）。没有这一行的话，唯一的线索是
+      读模型写的那句中文 note，或者人肉去看截图 —— 结论靠措辞，不靠机制。
+    """
+    verdict = record.login_state
+
+    if verdict == NOT_PROBED:
+        return _stat_row(
+            "登录态",
+            "未探测",
+            "这个任务不需要登录态（requires_login=false），所以没有去探。"
+            "★ 它和『探了但看不清』是两回事：前者一切正常，后者要人看一眼 —— "
+            "两种沉默的处置相反，所以在这里必须是两句不同的话。",
+        )
+
+    label = _LOGIN_LABEL.get(verdict, verdict)
+    note = record.login_state_reason
+
+    # ★ 落到的 URL 和任务起点不同，是"发生了跳转"的直接证据 ——
+    #   而跳转恰恰是"落在登录页"最常见的成因。起点和终点相同时就不必多说一句。
+    if record.login_state_url and record.login_state_url != record.start_url:
+        note += (
+            f"　（实际落到的 URL 是 {record.login_state_url}，"
+            f"与任务起点 {record.start_url} 不同 —— 发生了跳转）"
+        )
+
+    if verdict == LOGIN_PAGE:
+        note += (
+            "　★★ 本次的零行是**登录态失效**造成的，不是风控、也不是店里没数据。"
+            "这份报告里除这一行以外的内容都因此不作数。"
+            "修复：uv run python devtools/login_pdd.py（复核通过后它会打印该写进 .env 的那一行）"
+        )
+    elif verdict == UNKNOWN:
+        note += "　★ 我们看不清这一页，所以**没有**把它算作登录失效 —— 请看一眼截图自己判。"
+
+    return _stat_row("登录态", label, note)
 
 
 def render_report(
@@ -88,6 +145,9 @@ def render_report(
     #   一张有 12 行数据的漂亮结果，如果护栏一步都没判（selector_map 空），
     #   或者截图坏了一半，那 12 行数据的可信度是 0 —— 而这个判断必须在看数据【之前】做。
     parts.append("<section><h2>可信度（先看这块）</h2><table>")
+    # ★ 登录态排在最前面 —— 它比护栏判定还靠前，因为它否掉的是**整份报告**，
+    #   而不是某几行数据（见 _login_state_row）。
+    parts.append(_login_state_row(record))
     parts.append(
         _stat_row(
             "护栏判定",

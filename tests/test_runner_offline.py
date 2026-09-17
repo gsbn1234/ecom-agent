@@ -1083,6 +1083,250 @@ def test_migrate_adds_missing_column_to_an_old_database(tmp_path):
 
     assert old["task_id"] == "demo.books", "迁移把老数据弄丢了"
     assert json.loads(old["empty_selector_map_steps_json"]) == [], "老行的新列要有默认值"
+    # ★ 三条 login_state_* 是**后加的** —— 老库里没有它们，而老库是审计资产，
+    #   只能补列不能重建。默认 `''` 对老行是**诚实**的：那时确实没探过。
+    assert old["login_state"] == "", "老行的登录态默认值该是'没探过'，不是别的什么"
+    assert old["login_state_reason"] == ""
+    assert old["login_state_url"] == ""
+
+
+def test_login_state_reaches_sqlite(tmp_path):
+    """★★ schema 列 → ALTER 迁移 → INSERT → 读回，端到端一次走完。
+
+      和 `empty_selector_map_steps_json` 那条同一个理由：这几处**必须同时改**，
+      只改一处的后果是"新库和老库分叉"，也就是最难在 CI 里暴露的那种失败
+      （开发机上永远是对的，因为他的库是新键的）。
+
+      ★ 它还额外守着一个**通道**问题：登录态如果只落进 run.json，那么
+        "最近 20 次零行的 run 里有几次其实是被登录页挡下的"就得靠把 20 份
+        JSON 全读一遍才答得上来 —— 那就等于没人会去问。
+    """
+    import sqlite3
+
+    from ecom_agent.store.repository import Repository
+
+    db = tmp_path / "t.db"
+    record = RunRecord(
+        run_id="2026-01-01T00:00:00+00:00-abc123",
+        task_id="pdd.shop_overview",
+        status="completed",
+        parse_status=ParseStatus.EMPTY.value,
+        start_url="https://mms.pinduoduo.com/goods/goods_list",
+        login_state="login_page",
+        login_state_reason="URL 落在登录路径上：https://passport.pinduoduo.com/login",
+        login_state_url="https://passport.pinduoduo.com/login",
+    )
+    with Repository(db) as repo:
+        repo.save_run(record, (), redactor=None)
+        listed = repo.list_runs()
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (record.run_id,)).fetchone()
+    conn.close()
+
+    assert row["login_state"] == "login_page"
+    assert "passport.pinduoduo.com" in row["login_state_reason"]
+    assert row["login_state_url"] == "https://passport.pinduoduo.com/login"
+
+    # ★ 列表那条查询也要带上它 —— 否则"哪个通道能看见这个事实"就分叉了：
+    #   详情看得见、列表看不见，而列表恰恰是**第一眼**看的地方。
+    assert listed[0]["login_state"] == "login_page"
+
+
+# ── G2. 登录态探测：接在预检导航之后、烧 token 之前 ────────
+LOGIN_URL = "https://passport.pinduoduo.com/login"
+GOODS_URL = "https://mms.pinduoduo.com/goods/goods_list"
+
+
+class _ProbeSummary:
+    def __init__(self, url: str, text: str) -> None:
+        self.url = url
+        self.dom_state = type("D", (), {"llm_representation": lambda _s: text})()
+
+
+class _ProbeSession:
+    """探针眼里的一页。★ 只实现它真正用到的那一个方法。
+
+    ★ 少实现一个会让"探针开始依赖我没想到的东西"当场 AttributeError 地暴露；
+      多实现一个反而会把这件事盖住 —— 所以宁少勿多。
+    """
+
+    def __init__(self, url: str, text: str) -> None:
+        self._url, self._text = url, text
+        self.reads = 0
+
+    async def get_browser_state_summary(self, *, include_screenshot: bool = False):
+        assert include_screenshot is False, "探测不需要截图 —— 别顺手把视觉通道开起来"
+        self.reads += 1
+        return _ProbeSummary(self._url, self._text)
+
+
+class _FakeRunAgent:
+    """替掉 `browser_use.Agent`。★ 形状刻意做到最小。
+
+    `ActionModel` 用的是**真的**那个（从本项目注册表现造）：
+      `interceptor.check_wiring` 会拿它做一次 guard_notice 的端到端往返，
+      造假过不了 —— 而那道自检是"拒绝路径是否真的接上了"的唯一保证，
+      不该为了测试把它绕开。
+    `run()` 什么都不做、返回一个没有最终结果的 history ——
+      这几条用例验的是**探针**，不是 step 循环。
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.ActionModel = _tools().registry.create_action_model()
+
+    async def run(self, **_kwargs: Any):
+        return _FakeHistory(final=None)
+
+
+def _patch_run_once(monkeypatch, session):
+    """把 `_run_once` 依赖的两个外部东西换成假的，其余代码路径原样跑。"""
+    from contextlib import asynccontextmanager
+
+    import browser_use
+
+    @asynccontextmanager
+    async def fake_session(_compiled, *, warmup_url=None):
+        fake_session.warmup_url = warmup_url
+        yield session
+
+    fake_session.warmup_url = None
+
+    # ⚠️ 打的是**定义处**的模块属性：`_run_once` 里用的是函数内 import，
+    #   所以它每次都会重新到这两个模块上去取名字。
+    monkeypatch.setattr("ecom_agent.runtime.browser.browser_session", fake_session)
+    monkeypatch.setattr(browser_use, "Agent", _FakeRunAgent)
+    return fake_session
+
+
+def _run_once_with(runner, recorder):
+    return asyncio.run(
+        runner._run_once(llm=object(), tools=_tools(), recorder=recorder, attempt=1)
+    )
+
+
+def test_a_login_page_is_recorded_before_any_token_is_spent(tmp_path, pdd, monkeypatch):
+    """★★ 落在登录页这件事，必须在**任何 LLM 调用之前**被记下来。
+
+      ★ 为什么"之前"是关键，而不是"反正最后会落进 run.json"：
+        这个任务文本里写着"遇登录页立刻停止并汇报"，所以登录态失效时跑下去
+        **注定**零行。此刻是唯一还来得及改主意的时刻 ——
+        晚一步（比如放在 run 之后）就变成"事后解释一次白跑"，
+        而"能不能省下这次白跑"正是这个字段存在的全部理由。
+
+      ★ 这一条同时验了链路的后半段：`_build_record` 必须把它带上。
+        只验 `runner.login_state` 的话，"探了但没落盘"照样绿 ——
+        而那正是这个项目反复出现的那个家族（某个通道从没发过这个字段）。
+    """
+    recorder = make_recorder(tmp_path)
+    runner = make_runner(pdd, runs_dir=tmp_path)
+    session = _ProbeSession(LOGIN_URL, "请扫码登录")
+    fake = _patch_run_once(monkeypatch, session)
+
+    _run_once_with(runner, recorder)
+
+    assert fake.warmup_url == pdd.spec.start_url, "起点没传给浏览器层"
+    assert session.reads >= 1, "压根没探"
+
+    record = runner._build_record(
+        status="completed",
+        parse_status=ParseStatus.EMPTY.value,
+        structured=None,
+        history=None,
+        stop_reason="",
+        started=0.0,
+        recorder=recorder,
+    )
+    assert record.login_state == "login_page"
+    assert "passport.pinduoduo.com" in record.login_state_reason, "依据要一起落盘"
+    assert record.login_state_url == LOGIN_URL
+    assert record.rows_collected == 0 and record.parse_status == "empty", (
+        "这条用例模拟的正是那个'报告齐全但零行'的形状 —— 别的字段全都看不出问题"
+    )
+
+
+def test_a_task_that_does_not_need_login_is_never_probed(tmp_path, books, pdd, monkeypatch):
+    """★★ 不需要登录态的任务**一次都不许探** —— 而且这条要能证伪。
+
+      ★ 为什么"不探"本身是设计要求，而不是省了几毫秒：
+        mock / books 这类任务的页面上根本没有那些词，探了只会得到 `unknown`。
+        于是每次 run 都多一句"登录态：看不清" —— 而这条链上**唯一能省下一次
+        白跑**的那句话（"落在登录页上了"），会被这种日常噪声淹掉。
+        噪声的代价不是难读，是把该被看见的那一句变得不被看见。
+
+      ★ 对照在同一用例里：同一个探针、换成 `requires_login: true` 的模板，
+        `reads` 必须 > 0。没有这一半的话，一个**永远不探**的实现也能让上面通过 ——
+        而那种实现让这个字段永远空着，等于白加。
+    """
+    recorder = make_recorder(tmp_path)
+
+    idle = make_runner(books, runs_dir=tmp_path)
+    idle_session = _ProbeSession(LOGIN_URL, "请扫码登录")
+    _patch_run_once(monkeypatch, idle_session)
+    _run_once_with(idle, recorder)
+
+    assert books.spec.requires_login is False, "这个用例的前提是模板不需要登录态"
+    assert idle_session.reads == 0, "不需要登录态的任务却去探了页面"
+    assert idle.login_state.verdict == "", "没探过就该是 NOT_PROBED（空串）"
+    assert idle.login_state.verdict != "unknown", (
+        "★★ 空串与 unknown 是两种沉默：前者是'不需要'，后者是'探了看不清'。"
+        "压成一个值，报告就没法说清它到底是哪种"
+    )
+
+    # ── 对照：同一个探针、换一个需要登录态的模板 → 必须真的去探 ──
+    live = make_runner(pdd, runs_dir=tmp_path)
+    live_session = _ProbeSession(GOODS_URL, "商品管理 订单管理")
+    _patch_run_once(monkeypatch, live_session)
+    _run_once_with(live, recorder)
+
+    assert pdd.spec.requires_login is True
+    assert live_session.reads >= 1, "需要登录态的任务却没探"
+    assert live.login_state.verdict == "logged_in"
+
+
+def test_the_probe_reads_the_page_the_run_actually_lands_on(tmp_path, pdd, monkeypatch):
+    """★ 探的必须是**预检导航之后**那一页，不是另开一页去看起点 URL。
+
+      差别不是洁癖：登录态失效时真实发生的正是"导航到商品页 → 被弹到登录页"。
+      另开一页去看的话，看到的是重定向**之前**的东西，于是每次都判成"已登录" ——
+      一个永远说没事的探针比没有探针更坏。
+    """
+    recorder = make_recorder(tmp_path)
+    runner = make_runner(pdd, runs_dir=tmp_path)
+    _patch_run_once(monkeypatch, _ProbeSession(GOODS_URL, "商品管理 订单管理"))
+
+    _run_once_with(runner, recorder)
+
+    assert runner.login_state.url == GOODS_URL, "探到的 URL 要原样记下来"
+    assert runner.login_state.verdict == "logged_in"
+
+
+def test_probe_failure_does_not_take_the_run_down(tmp_path, pdd, monkeypatch):
+    """★★ 探针是**诊断**，它坏掉绝不允许把 run 弄挂。
+
+      会话读不到（窗口关了 / CDP 断了）时，run 必须照常跑完、照常出报告。
+      否则"加了一个诊断字段"的净效果是**多了一种 run 失败的方式** ——
+      那比不诊断更糟。
+    """
+
+    class _DeadSession:
+        async def get_browser_state_summary(self, **_kw):
+            raise RuntimeError("Target closed")
+
+    recorder = make_recorder(tmp_path)
+    runner = make_runner(pdd, runs_dir=tmp_path)
+    _patch_run_once(monkeypatch, _DeadSession())
+
+    result = _run_once_with(runner, recorder)
+
+    assert result is not None, "探针失败把整个 attempt 弄挂了"
+    assert runner.login_state.verdict == "unknown"
+    assert "Target closed" in runner.login_state.reason, (
+        "异常要原样带上，否则排查时不知道发生了什么"
+    )
+    assert runner.login_state.is_login_page is False, "读不到 ≠ 落在登录页 —— 不能倒向那个方向"
 
 
 # ── H. CLI ────────────────────────────────────────────────
@@ -1107,6 +1351,67 @@ def test_parse_params_rejects_malformed_and_does_not_guess():
         _parse_params(["limit"])
     with pytest.raises(ValueError, match="名字是空的"):
         _parse_params(["=3"])
+
+
+def test_login_cell_keeps_the_two_silences_apart():
+    """★★ 列表里的登录态列，`""`（没探）和 `unknown`（探了看不清）必须是**两种显示**。
+
+      ★ 压成同一个（都显示"未知"或都显示"-"）的后果很具体：一排 `empty / 0`
+        的行里，人会分不清该去扫码、该去看截图、还是本来就没什么可看的。
+        这一列存在的全部意义就是让人**不用看别的**就能分出来。
+    """
+    from ecom_agent.runtime.cli import _login_cell
+
+    assert _login_cell("") == "-", "不需要登录态的任务显示成'-'，不是'未知'"
+    assert _login_cell(None) == "-", "老库（迁移前没有这一列）读出来是 None，不能崩"
+    assert _login_cell("") != _login_cell("unknown")
+    assert _login_cell("unknown") == "看不清"
+    assert _login_cell("login_page") != _login_cell("logged_in")
+
+
+def test_the_runs_listing_actually_prints_the_login_state(tmp_path, monkeypatch, capsys):
+    """★ 列进了 SQL 还不够 —— 还得**真的打在屏幕上**。
+
+      这是那个家族的又一扇门：`SELECT` 加了字段、`print` 那行没加，
+      于是"库里有、列表里没有"。而这种缺口是**看不出来**的 ——
+      列表照常显示、不报错，只是少了那一列，看起来像"本来就只显示这些"。
+    """
+    import argparse
+
+    from ecom_agent.runtime import cli as C
+    from ecom_agent.store.repository import Repository
+
+    db = tmp_path / "t.db"
+    with Repository(db) as repo:
+        repo.save_run(
+            RunRecord(
+                run_id="r-login",
+                task_id="pdd.shop_overview",
+                status="completed",
+                parse_status="empty",
+                login_state="login_page",
+            ),
+            (),
+            redactor=None,
+        )
+        repo.save_run(
+            RunRecord(run_id="r-idle", task_id="demo.books", status="completed", parse_status="ok"),
+            (),
+            redactor=None,
+        )
+
+    monkeypatch.setattr(C, "DB_PATH", db)
+    assert C.cmd_runs(argparse.Namespace(limit=10)) == C.EXIT_OK
+    out = capsys.readouterr().out
+
+    assert "登录态" in out, "表头没有这一列"
+    # ★ 两行都按 run_id 取出来对比（不是"整份输出里有没有那个词"）——
+    #   两次 run 在别的列里几乎一样（都是 completed / empty / 0 行），
+    #   所以只有**并排看这两行**才能证明这一列真的在区分它们。
+    rows = {line.split()[0]: line for line in out.splitlines() if line.strip()}
+    assert "r-login" in rows and "r-idle" in rows, "两次 run 都得在列表里"
+    assert "⚠️登录页" in rows["r-login"]
+    assert "⚠️登录页" not in rows["r-idle"], "不需要登录态的那次也被标成登录页了"
 
 
 @pytest.mark.parametrize(

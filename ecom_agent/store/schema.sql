@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS runs (
     sanity_flags_json     TEXT NOT NULL DEFAULT '{}',
     result_raw            TEXT NOT NULL DEFAULT '',
 
+    -- 这次 run **实测**到的登录态。★ 必须能落进 SQL 而不是只在 run.json 里：
+    --   "最近这 20 次零行的 run 里，有几次其实是被登录页挡下的"是一个
+    --   **该用一条 SQL 问出来**的问题。只有 JSON 文件的话，它得靠把 20 份
+    --   run.json 全读一遍才答得上来 —— 那就等于没人会去问。
+    --   （同样是那个家族：一个字段只在某个通道里存在，别的通道就看不见它。）
+    login_state              TEXT NOT NULL DEFAULT '',
+    login_state_reason       TEXT NOT NULL DEFAULT '',
+    login_state_url          TEXT NOT NULL DEFAULT '',
+
     -- 观测自身的健康度
     screenshot_count          INTEGER NOT NULL DEFAULT 0,
     same_frame_steps_json     TEXT NOT NULL DEFAULT '[]',
