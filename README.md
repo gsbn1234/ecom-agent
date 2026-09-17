@@ -14,11 +14,12 @@
 > [`docs/spikes.md`](docs/spikes.md)（探路实测结论 + 逐条判据 + CI 排查全程）、
 > [`docs/guardrail_design.md`](docs/guardrail_design.md)（三层护栏各能挡什么、**挡不住什么**）。
 >
-> 测试现状：**411 条 = 394 条离线（CI 硬门禁）+ 17 条 `needs_browser`（本地硬门禁）**。
+> 测试现状：**454 条 = 437 条离线（CI 硬门禁）+ 17 条 `needs_browser`（本地硬门禁）**。
 > **ADR/README 定稿那次推送 = [`de1ac57`](https://github.com/gsbn1234/ecom-agent/commit/de1ac57)，
 > CI run [`35233757564`](https://github.com/gsbn1234/ecom-agent/actions/runs/35233757564)
 > 两个 job 全绿**，且浏览器 job 是真绿 —— gate 走的是「**测试绿**」那条分支，
 > 不是「环境不可用被放行」那条（两者**颜色完全一样，只有注解分得开**）：
+> （那次 run 的注解原文 —— 所以这里的 394 是**当时**的数，不是现在的）
 > `needs_browser 实际结果：17 passed, 394 deselected ；退出码 0` + `探针结论：环境可用`。
 >
 > ⚠️ 这里**点名 commit，不写"最近一次推送"** —— 后者每推一次就自动过期一次，
@@ -55,8 +56,8 @@ cd ecom-agent
 uv venv && uv pip install -e ".[dev]"
 
 cp .env.example .env      # 填 DEEPSEEK_API_KEY
-uv run pytest -m "not needs_browser"   # 离线 394 条，零 token 零网络，应当全绿
-uv run pytest                          # 全部 411 条（含 17 条真浏览器，会真的开 Chrome）
+uv run pytest -m "not needs_browser"   # 离线 437 条，零 token 零网络，应当全绿
+uv run pytest                          # 全部 454 条（含 17 条真浏览器，会真的开 Chrome）
 ```
 
 > ⚠️ **`uv run pytest` 默认包含 `needs_browser`** —— 想"零 token 零网络"地跑一遍，
@@ -141,9 +142,9 @@ uv run python main.py run tasks/books_demo.yaml    # 用公开练手站点，不
 ## 测试分层
 
 ```bash
-uv run pytest -m "not needs_browser"   # 394 条离线：DSL / 护栏 / 脱敏 / 落库 / 报告 / API
+uv run pytest -m "not needs_browser"   # 437 条离线：DSL / 护栏 / 脱敏 / 落库 / 报告 / API
 uv run pytest -m needs_browser         # 17 条：需要真实浏览器，对着本地 mock 站点跑
-uv run pytest                          # 411 条全部 = 394 + 17（默认就包含 needs_browser）
+uv run pytest                          # 454 条全部 = 437 + 17（默认就包含 needs_browser）
 ```
 
 > 分层的主轴不是"快慢"，是**依赖什么**：纯逻辑 → 临时文件 → asyncio → 真浏览器。
@@ -207,8 +208,8 @@ FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc:129] No usable sandb
 ## 这个项目**没做到**的事
 
 按重要程度排。全部可核对 —— 每一条都能顺着指到具体 run、具体文件、具体测试名。
-写在这里的理由是：**主动说清边界，比被问出来强**；而且这一节里有一条，是写
-ADR 的时候才核出来的（原来我以为它有测试）。
+写在这里的理由是：**主动说清边界，比被问出来强**；而且这一节里没有一条是"想出来的"
+—— 第 1 条是真跑出来的、第 2 条是补上一条缺口时顶出来的、第 4 条是彩排时撞上的。
 
 **1. 没在真站点采到"这个店铺自己的商品"**
 
@@ -223,14 +224,31 @@ ADR 的时候才核出来的（原来我以为它有测试）。
 说清楚：`extract_cards`（S8 探路的产出）**不解决**这件事。它解决的是"那一页不是
 表格、`extract_table` 只认表格"这个**形态**问题，不是"店里没货"这个**数据**问题。
 
-**2. `sanity_flags()` / `_detect_pii()` / `suspicious` 零测试覆盖**
+**2. 脱敏（`Redactor`）有两条已知盖不住的形态，而且它承诺的文档是空的**
 
-"可疑数据**只标记不删除**"这条原则（ADR 11）**代码里有、测试里没有**。
-`ecom_agent/sites/pinduoduo/output_models.py:85` 的 `sanity_flags()`、
-`ecom_agent/store/repository.py:349` 的 `_detect_pii()` 都是纯逻辑、零依赖、
-本该有几个用例的 —— 而 `tests/` 下对这几个名字的全部命中，只有一处**建表 DDL 的
-列名**（`tests/test_runner_offline.py:1060`），也就是"名字出现过"，不是"逻辑被测过"。
-`products.suspicious` 列同样没有任何用例断言它被置过 1。
+补 `sanity_flags()` / `_detect_pii()` / `suspicious` 的用例时（原来这条缺口记的
+就是它们零覆盖）顺带核出：`_detect_pii()` 只是 `Redactor` 规则表的一个投影，
+而 **`Redactor` 整个类在 `tests/` 下零命中** —— 不是"名字没出现过"，是
+**没有任何一条用例断言过 `<REDACTED>` 产物**。现在有守卫了：
+`tests/test_sanity_and_pii.py`（43 条 = 42 passed + 1 xfail，其中 6 条对照实验
+逐条验过"拆掉机制就会红"）。补完之后**仍盖不住**的是这两条：
+
+| 形态 | 实测结果 | 为什么 |
+|---|---|---|
+| `Authorization: Bearer <token>` | **一个字都不盖**（`_detect_pii` 返回 `[]`，文本原样） | 规则的 `[:=]` 要求冒号在关键字**之后**，而真实头部的冒号在 `Bearer` **之前** → 那个 `bearer` 分支对它的规范形态**永远不命中** |
+| 标题里的订单号 | 盖不住 | 「长数字串一律盖掉」这条规则是**故意没有**的：pdd 的 `goods_id` 本身就是长数字，笼统盖掉会把任务真正要采集的数据一起毁掉（还毁得很安静）。订单号只能靠 YAML 的 `redact_extra` 给精确形态 |
+
+第二条是**取舍**（有代价、也有理由），第一条是**缺陷**：`token:` / `api_key=`
+这些形态是好的，于是"凭证类规则在工作"看起来成立 —— 正是 `redact.py` 的 docstring
+自己警告过的那种失效（"最危险的地方在于它看起来在工作"）。
+
+⚠️ 还有一处**反向的文档漂移**：`ecom_agent/observability/redact.py:50` 的注释写着
+"这条限制写进 `docs/guardrail_design.md` 的失效边界"，而那份文档里"脱敏"**零命中**
+—— 承诺从没兑现（顺带：计划里写的 `docs/observability_schema.md` 也根本不存在）。
+
+处置：Bearer 那条用 **`strict xfail` 钉住**（现在是 `xfailed`；谁修好它会变成 XPASS
+并主动失败，提醒删标记）。**修 `redact.py` 本身是生产代码改动，本轮没做** ——
+它改的是安全控制的射程，得单独拍板。
 
 **3. 没有写入型的真站点任务**
 
