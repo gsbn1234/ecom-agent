@@ -147,21 +147,29 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     print(compiled.describe() if args.verbose_text else
           f"任务 {compiled.task_id}（{spec.name}）指纹 {compiled.fingerprint[:16]}")
 
-    if args.dry_run:
-        print("--dry-run：已编译，未启动浏览器")
-        return EXIT_OK
-
     if spec.requires_login:
         # ★ 只在 requires_login 的任务上做这个检查 —— 只读 mock 任务不需要登录，
         #   在它们身上每次都唠叨一遍，只会训练人忽略这句话。
         #   ★ 这里是**警告不是拒绝**：没有 profile 的 run 是设计内的合法结果
         #     （agent 看到登录页 → 按任务文本停下汇报），不该被拦住；
         #     我们要消灭的是"它悄悄发生了"。
+        #
+        # ★★ 位置不是随手放的：必须在 `--dry-run` 早退【之前】。
+        #   这条检查不碰浏览器（只读盘上的标记文件），放前面是零成本的；
+        #   而 `--dry-run` 存在的全部意义就是"花零成本先看清会出什么事"，
+        #   偏偏真站点 run 最可能**静默零行**的原因就是登录态
+        #   （完整机制见 docs/spikes.md 的「Phase 6 探路结论」）。
+        #   放在早退之后 = 彩排恰好看不见那件最该看的事。
+        #   ⚠️ 别把它移回去：那是"彩排全绿、正式跑零行"的配方。
         problem = check_profile(args.profile)
         if problem:
             print(f"⚠️  登录态检查：{problem}", file=sys.stderr)
         else:
             print(f"登录态：{describe_ready(args.profile)}")
+
+    if args.dry_run:
+        print("--dry-run：已编译，未启动浏览器")
+        return EXIT_OK
 
     try:
         outcome = await run_task(
