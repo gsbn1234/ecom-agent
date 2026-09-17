@@ -157,7 +157,9 @@ docstring 的原话是 *"matches exactly what goes into the DOMTreeSerializer ou
 **顺带一条对 Phase 4 有用的发现**：只读的「搜索」在 mock 主机上落到了 `default_decision=confirm`，
 因为 `allow-readonly` 规则带 `match_url: "*mms.pinduoduo.com/*"`，本站不匹配。
 这不是 bug——是「规则集是按真实站点写的」的必然结果，也正是计划里要单独有
-`platform/mock.yaml` 的原因。**提前看到，Phase 4 就不会卡在「e2e 里每点一次搜索都要人工审批」。**
+`platform/mock.yaml` 的原因。⚠️ **但那个文件最终没有建**：URL 作用域改由每份任务模板
+自己的 `match_url` 承担（见 `tasks/mock_shop_readonly.yaml` 的 `allow-readonly`）。
+**提前看到，Phase 4 就不会卡在「e2e 里每点一次搜索都要人工审批」。**
 
 ### 判据 4：⚠️ 计划外发现 —— 快照不是不可变的
 
@@ -455,7 +457,7 @@ spike 里有些断言是**有条件**的——那时候还在发现阶段，不�
 | 位置 | spike 的写法 | 测试的写法 | 为什么改 |
 |---|---|---|---|
 | S3 被拦之后的页面 | `if after == "about:blank"` 才打印结论 | 无条件 `assert urls[-1] == "about:blank"` | 有条件的断言在条件不成立时**静默通过**，读者却以为验过了 |
-| S2 只读操作的判定 | 只 `print` 出 `confirm` | 断言 `is Decision.CONFIRM` | 它是 ADR-7（fail-closed）在真实页面上的证据，也是 `platform/mock.yaml` 必须有自己的 URL 作用域的依据 |
+| S2 只读操作的判定 | 只 `print` 出 `confirm` | 断言 `is Decision.CONFIRM` | 它是 ADR-7（fail-closed）在真实页面上的证据，也是「mock 任务模板必须自带 URL 作用域」的依据 —— 该作用域最终落在 `tasks/mock_shop_readonly.yaml` 的 `match_url` 上（计划里的 `platform/mock.yaml` **始终没建**） |
 
 ### 断言有牙：一次变异检验
 

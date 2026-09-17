@@ -360,13 +360,17 @@ async def test_meaningful_text_drives_policy(site: Site) -> None:
     #
     #    ⚠️ Phase 4 的直接后果：mock 后台的 e2e 如果不带自己的 URL 作用域，
     #    每一次"点搜索"都要人工批一次，e2e 会变成人肉点击流水线。
-    #    所以 platform/mock.yaml 必须有自己的 match_url —— 这条断言就是
-    #    那个需求的证据，而不是一句"我记得好像会这样"。
+    #    所以 mock 的任务模板必须自带 `match_url` —— 这条断言就是那个需求的
+    #    证据，而不是一句"我记得好像会这样"。
+    #    （这里原先写的是"platform/mock.yaml 必须有自己的 match_url"，但那个
+    #      文件始终没建：作用域落在了 tasks/mock_shop_readonly.yaml 的
+    #      allow-readonly 规则上。**指向不存在的文件 = 下一处漂移**。）
     assert verdicts["搜索"].decision is Decision.CONFIRM, (
         f"『搜索』的判定是 {verdicts['搜索'].decision.value}，预期 confirm（default_decision）。\n"
         f"  · 若变成 allow → 说明有一条作用域外的规则放行了它，fail-closed 被破坏，ADR-7 要重审\n"
         f"  · 若变成 block → 护栏过严，正常只读任务会被卡死\n"
-        f"  两种情况都意味着 platform/mock.yaml 的设计前提变了。"
+        f"  两种情况都意味着 mock 任务模板的 URL 作用域（tasks/mock_shop_readonly.yaml"
+        f" 的 match_url）这个设计前提变了。"
     )
 
 
