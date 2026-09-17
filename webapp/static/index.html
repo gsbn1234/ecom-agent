@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ecom-agent 看板</title>
+<!--
+  ★ 为什么是原生单页而不是 Streamlit（ADR-12）：
+    Streamlit 的 rerun 模型（任何交互都重跑整个脚本）和「长驻的审批按钮 +
+    SSE 实时流」直接冲突 —— 而这正是本页的核心交互。
+    原生单页零依赖零构建，并且【同一份代码加个 ?run_id= 就变成历史回放】。
+
+  ★★ 本文件的唯一一条硬约束：**只有一个渲染器**。
+     实时 SSE 收到的 step_completed，和从 GET /api/runs/{id} 读回放拿到的
+     step_completed，形状完全一样（都是 steps.jsonl 的一行），所以两者都走
+     `renderStep()`。历史回放不是"另一套只读渲染"——
+     一旦做成两套，它们会开始漂移，而漂移的表现是"回放看到的历史和当时看到的不一样"，
+     没有人会立刻发现。
+-->
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e8ec; --dim: #9aa3b2; --accent: #4c8dff;
+    --ok: #3fb950; --warn: #d29922; --bad: #f85149; --live: #a371f7;
+    --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.55 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  code, .mono { font-family: var(--mono); font-size: 12.5px; }
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 12px 18px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .sp { flex: 1; }
+  .badge {
+    padding: 2px 9px; border-radius: 99px; font-size: 12px;
+    border: 1px solid var(--line); color: var(--dim);
+  }
+  .badge.ok { color: var(--ok); border-color: #24402a; background: #12200f30; }
+  .badge.bad { color: var(--bad); border-color: #4a2020; background: #2a141430; }
+  .badge.warn { color: var(--warn); border-color: #47391a; background: #2a241030; }
+
+  .wrap { display: grid; grid-template-columns: 300px 1fr; gap: 0; min-height: calc(100vh - 47px); }
+  aside { background: var(--panel); border-right: 1px solid var(--line); padding: 14px; }
+  main { padding: 18px; min-width: 0; }
+
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--dim); margin: 18px 0 8px; font-weight: 600; }
+  h2:first-child { margin-top: 0; }
+
+  .item {
+    padding: 8px 10px; border-radius: 7px; cursor: pointer;
+    border: 1px solid transparent; margin-bottom: 4px;
+  }
+  .item:hover { background: var(--panel2); }
+  .item.sel { background: var(--panel2); border-color: var(--accent); }
+  .item .t { font-weight: 600; }
+  .item .s { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .row.between { justify-content: space-between; }
+
+  label.f { display: block; margin-bottom: 10px; }
+  label.f span { display: block; color: var(--dim); font-size: 12px; margin-bottom: 3px; }
+  input, select, textarea {
+    width: 100%; padding: 7px 9px; border-radius: 7px; background: var(--bg);
+    color: var(--fg); border: 1px solid var(--line); font: inherit;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  button {
+    padding: 7px 14px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--fg); font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.ok { background: #1f6f34; border-color: #1f6f34; color: #fff; }
+  button.bad { background: #8b2b26; border-color: #8b2b26; color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* 步骤时间线 */
+  .step { border-left: 3px solid var(--line); padding: 0 0 0 14px; margin: 0 0 16px; }
+  .step.blocked { border-left-color: var(--bad); }
+  .step.asked   { border-left-color: var(--warn); }
+  .step .hd { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .step .n { font-family: var(--mono); font-weight: 700; color: var(--accent); }
+  .step .attrs { color: var(--dim); font-size: 12px; font-family: var(--mono); }
+  .step .thought { color: var(--dim); font-style: italic; margin: 6px 0; }
+  ul.acts { margin: 6px 0; padding-left: 18px; }
+  ul.acts li { margin: 2px 0; }
+  .pill { padding: 1px 7px; border-radius: 99px; font-size: 11.5px;
+          border: 1px solid var(--line); font-family: var(--mono); }
+  .pill.allow    { color: var(--ok);   border-color: #24402a; }
+  .pill.block    { color: var(--bad);  border-color: #4a2020; }
+  .pill.confirm  { color: var(--warn); border-color: #47391a; }
+  .pill.exempt   { color: var(--dim); }
+  .pill.approved { color: var(--ok);   border-color: #24402a; }
+  .pill.denied   { color: var(--bad);  border-color: #4a2020; }
+
+  .dec { margin: 3px 0; font-size: 13px; }
+  .dec .why { color: var(--dim); }
+  .err { color: var(--bad); font-family: var(--mono); font-size: 12.5px; }
+  .note { color: var(--dim); font-size: 12.5px; }
+  img.shot { max-width: 340px; border: 1px solid var(--line); border-radius: 7px;
+             margin-top: 8px; display: block; cursor: zoom-in; }
+
+  /* 实时事件卡（回放里没有的那一类）*/
+  .liveev {
+    border: 1px dashed #4c3a7a; background: #1a1430; border-radius: 9px;
+    padding: 10px 13px; margin-bottom: 12px;
+  }
+  .liveev .tag { color: var(--live); font-size: 11.5px; font-weight: 700;
+                 text-transform: uppercase; letter-spacing: .06em; }
+  .liveev .liveonly { color: var(--dim); font-size: 12px; margin-top: 5px; }
+
+  /* 审批卡 */
+  .appr { border: 1px solid var(--warn); background: #241d0d; border-radius: 10px;
+          padding: 14px; margin-bottom: 14px; }
+  .appr.done { border-color: var(--line); background: var(--panel); opacity: .75; }
+  .appr h3 { margin: 0 0 8px; font-size: 14px; }
+  .appr table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+  .appr td { padding: 3px 8px 3px 0; vertical-align: top; font-size: 13px; }
+  .appr td.k { color: var(--dim); white-space: nowrap; width: 76px; }
+
+  #lightbox { position: fixed; inset: 0; background: #000c; display: none;
+              align-items: center; justify-content: center; z-index: 100; cursor: zoom-out; }
+  #lightbox img { max-width: 94vw; max-height: 94vh; border-radius: 8px; }
+  .hr { height: 1px; background: var(--line); margin: 14px 0; }
+  #err { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>ecom-agent 看板</h1>
+  <span class="badge" id="health">健康检查中…</span>
+  <span class="sp"></span>
+  <span class="badge" id="conn">未连接</span>
+</header>
+
+<div class="wrap">
+  <aside>
+    <h2>模板</h2>
+    <div id="templates"></div>
+    <h2>历史 run</h2>
+    <div id="history"></div>
+    <div class="hr"></div>
+    <button id="refresh" style="width:100%">刷新历史</button>
+  </aside>
+
+  <main>
+    <div id="startPanel" class="card" style="display:none">
+      <div class="row between">
+        <strong id="tplName"></strong>
+        <span class="mono" id="tplId" style="color:var(--dim)"></span>
+      </div>
+      <div class="note" id="tplGoal" style="margin:8px 0"></div>
+      <div id="tplForm"></div>
+      <div class="row">
+        <button class="primary" id="startBtn">开始运行</button>
+        <span class="note">参数不合法会在创建浏览器之前被拒（零 token 零浏览器）</span>
+      </div>
+    </div>
+
+    <div id="runPanel" style="display:none">
+      <div class="card">
+        <div class="row between">
+          <strong id="runTitle">—</strong>
+          <span class="badge" id="runStatus">—</span>
+        </div>
+        <div class="mono note" id="runMeta" style="margin-top:6px"></div>
+        <div id="runErrors" style="margin-top:8px"></div>
+      </div>
+      <div id="approvals"></div>
+      <div id="timeline"></div>
+    </div>
+
+    <div id="empty" class="note">← 左边选一个模板，或者点一条历史 run 看回放。</div>
+  </main>
+</div>
+
+<div id="lightbox"><img alt="screenshot"></div>
+
+<script>
+"use strict";
+// ── 极小的 DOM 助手 ───────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  // ★ 一律用 textContent，全文件不出现 innerHTML。
+  //   页面上显示的东西（元素文本、LLM 的 thought、错误消息）全部来自
+  //   **被操作的网页**和**LLM 的输出** —— 那两个来源都不可信。
+  //   用 innerHTML 拼的话，一个页面标题里的 <script> 就能在这个看板里执行。
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+
+// ── 会话状态 ──────────────────────────────────────────────
+const S = {
+  templates: [],
+  template: null,
+  runId: null,
+  es: null,          // 当前 EventSource
+  lastSeq: 0,        // 去重 + 丢事件检测
+  reconnects: 0,
+  replaying: false,
+  approvals: new Set(),   // 已经画过卡片、还没解决的审批 id
+};
+
+// ── 健康检查 ──────────────────────────────────────────────
+async function health() {
+  const b = $("health");
+  try {
+    const r = await fetch("/api/health");
+    const j = await r.json();
+    b.className = "badge " + (j.status === "ok" ? "ok" : j.status === "degraded" ? "warn" : "bad");
+    b.textContent = { ok: "就绪", degraded: "降级（能看历史，起不了新 run）", unhealthy: "不可用" }[j.status] || j.status;
+    b.title = JSON.stringify(j, null, 2);
+  } catch (e) {
+    b.className = "badge bad"; b.textContent = "健康检查失败"; b.title = String(e);
+  }
+}
+
+// ── 模板 ──────────────────────────────────────────────────
+async function loadTemplates() {
+  const j = await (await fetch("/api/templates")).json();
+  S.templates = j.templates || [];
+  const box = $("templates"); box.textContent = "";
+  for (const t of S.templates) {
+    if (t.broken) {
+      // ★ 坏模板也列出来并显示原因。静默跳过的话，一个写错的 YAML 在界面上
+      //   表现为"不存在"，而它明明躺在 tasks/ 里 —— 人会去查前端。
+      //   键名与好模板一致（都用 template_id），不写 `t.file || t.template_id`
+      //   那种"两个名字哪个才算"的分支。
+      const d = el("div", "item");
+      d.appendChild(el("div", "t", t.template_id + " ⚠"));
+      d.appendChild(el("div", "s", "加载失败：" + t.broken.slice(0, 90)));
+      box.appendChild(d);
+      continue;
+    }
+    const d = el("div", "item");
+    d.appendChild(el("div", "t", t.name));
+    d.appendChild(el("div", "s", t.id + (t.requires_login ? " · 需登录" : "")));
+    d.onclick = () => selectTemplate(t, d);
+    box.appendChild(d);
+  }
+}
+
+function selectTemplate(t, node) {
+  S.template = t;
+  document.querySelectorAll("#templates .item").forEach((n) => n.classList.remove("sel"));
+  if (node) node.classList.add("sel");
+  $("startPanel").style.display = "";
+  $("tplName").textContent = t.name;
+  $("tplId").textContent = t.id;
+  $("tplGoal").textContent = t.goal || "";
+  const f = $("tplForm"); f.textContent = "";
+  for (const p of t.params || []) {
+    const lab = el("label", "f");
+    const cap = p.name + (p.required ? " *" : "") + (p.description ? " — " + p.description : "");
+    lab.appendChild(el("span", null, cap));
+    let inp;
+    if (p.type === "enum") {
+      inp = el("select");
+      for (const v of p.enum || []) {
+        const o = el("option", null, v); o.value = v; inp.appendChild(o);
+      }
+    } else if (p.type === "boolean") {
+      inp = el("input"); inp.type = "checkbox";
+      if (p.default) inp.checked = true;
+    } else {
+      inp = el("input");
+      inp.type = (p.type === "integer" || p.type === "number") ? "number" : "text";
+      if (p.minimum !== null && p.minimum !== undefined) inp.min = p.minimum;
+      if (p.maximum !== null && p.maximum !== undefined) inp.max = p.maximum;
+    }
+    if (p.default !== null && p.default !== undefined && p.type !== "boolean") inp.value = p.default;
+    inp.dataset.pname = p.name;
+    inp.dataset.ptype = p.type;
+    lab.appendChild(inp);
+    f.appendChild(lab);
+  }
+}
+
+function collectParams() {
+  const out = {};
+  for (const inp of $("tplForm").querySelectorAll("[data-pname]")) {
+    const t = inp.dataset.ptype;
+    if (t === "boolean") { out[inp.dataset.pname] = inp.checked; continue; }
+    const v = inp.value;
+    // ★ 空串**不传**而不是传 ""：传空串会让 required 参数"看起来提供了"，
+    //   而传给编译器的实际是空字符串。不传，让编译器的默认值 / 缺失检查生效。
+    if (v === "") continue;
+    out[inp.dataset.pname] = (t === "integer") ? parseInt(v, 10)
+                            : (t === "number") ? parseFloat(v) : v;
+  }
+  return out;
+}
+
+// ── 历史 ──────────────────────────────────────────────────
+async function loadHistory() {
+  const j = await (await fetch("/api/runs")).json();
+  const box = $("history"); box.textContent = "";
+  if (!(j.runs || []).length) { box.appendChild(el("div", "note", "（还没有 run）")); return; }
+  for (const r of j.runs) {
+    const d = el("div", "item");
+    d.appendChild(el("div", "t", r.task_name || r.task_id || r.run_id));
+    const tag = r.incomplete ? "未完成（无 run.json）"
+              : (r.status || "?") + " / " + (r.parse_status || "?") + " · " + r.rows_collected + " 行";
+    d.appendChild(el("div", "s", tag));
+    d.appendChild(el("div", "s", r.run_id));
+    d.onclick = () => openReplay(r.run_id);
+    box.appendChild(d);
+  }
+}
+
+// ── 运行视图 ──────────────────────────────────────────────
+function resetView(runId) {
+  S.runId = runId; S.lastSeq = 0; S.reconnects = 0; S.replaying = false;
+  S.approvals = new Set();
+  $("empty").style.display = "none";
+  $("runPanel").style.display = "";
+  $("timeline").textContent = "";
+  $("approvals").textContent = "";
+  $("runErrors").textContent = "";
+  $("runTitle").textContent = runId;
+  setStatus("running", "连接中…");
+  $("runMeta").textContent = "";
+}
+
+function setStatus(status, text) {
+  const b = $("runStatus");
+  const cls = { running: "", ok: "ok", warn: "warn", bad: "bad" }[status] || "";
+  b.className = "badge " + cls;
+  b.textContent = text || status;
+}
+
+// ── ★★ 唯一的渲染器 ───────────────────────────────────────
+// 实时 SSE 和回放 HTTP 都调这一个函数，因为两边的载荷形状完全一样。
+function handleEvent(ev) {
+  const type = ev.type, d = ev.data || {};
+
+  // ★ 去重：EventSource 在连接断开后会自动重连，服务端会把 backlog
+  //   重发一遍。不去重的话，重连一次页面上的步骤就翻倍。
+  //   seq 由总线分配、严格递增，所以它是天然的去重键。
+  if (ev.seq) {
+    if (ev.seq <= S.lastSeq) return;
+    // ★ 丢事件检测。总线对跟得慢的订阅者会丢最旧的并补一条 stream_gap，
+    //   所以正常情况下 seq 不跳号；这里是**第二道**，覆盖"缺口通知还没送到"
+    //   的那个窗口（通知是在订阅者下次来读时才发的，见 events.py 的 _Subscriber）。
+    //   两道都通向同一个动作，所以多触发一次是无害的。
+    if (S.lastSeq && ev.seq > S.lastSeq + 1) {
+      note("检测到事件不连续（" + S.lastSeq + " → " + ev.seq + "），正在从盘上补全…");
+      resync();
+    }
+    S.lastSeq = ev.seq;
+  }
+
+  switch (type) {
+    case "run_started": {
+      $("runTitle").textContent = (d.task_name || d.task_id || "run") + " · " + d.run_id;
+      $("runMeta").textContent =
+        "起点 " + (d.start_url || "-") + "\n参数 " + JSON.stringify(d.params || {}) +
+        "\n指纹 " + String(d.task_fingerprint || "").slice(0, 16) +
+        "\n白名单 " + JSON.stringify(d.allowed_domains || []);
+      setStatus("running", "运行中");
+      break;
+    }
+    case "step_completed":
+      renderStep(d);
+      break;
+    case "approval_required":
+      renderApprovalCard(d);
+      break;
+    case "approval_resolved":
+      resolveApprovalCard(d);
+      break;
+    case "guardrail_blocked":
+      renderLiveBlock(d);
+      break;
+    case "run_completed": {
+      $("runMeta").textContent += "\n结束 " + (d.finished_at || "") +
+        " · 耗时 " + (d.duration_s || 0) + "s · " + (d.attempts || "?") + " 次尝试";
+      const ok = d.status === "completed";
+      setStatus(ok ? "ok" : "bad", (d.status || "?") + " / " + (d.parse_status || "?") +
+                                   " · " + (d.rows_collected || 0) + " 行");
+      if (d.errors && d.errors.length) {
+        const box = $("runErrors");
+        for (const e of d.errors) box.appendChild(el("div", "err", "• " + e));
+      }
+      // ★ 回放流也要**关掉**，不能只换个标签。
+      //   回放的事件是有限的：服务端推完最后一条就把连接结束了，
+      //   而 EventSource 见到连接结束会自己重连（默认 3 秒一次）——
+      //   于是"打开一条历史 run"会变成一个每 3 秒重下一遍全量回放的死循环：
+      //   页面看不出异常（重连回来的事件全被 seq 去重掉了），
+      //   只有服务端日志里在持续地重复劳动。
+      closeStream(d.replay ? "回放" : "已完成");
+      break;
+    }
+    case "error": {
+      const box = $("runErrors");
+      box.appendChild(el("div", "err",
+        "[" + (d.where || "run") + "] " + (d.kind || "Error") + ": " + (d.message || "")));
+      if (d.fatal) { setStatus("bad", "失败"); closeStream("失败"); }
+      break;
+    }
+    case "stream_gap":
+      // 总线明确告诉我们"你漏了东西"。走的路和 seq 跳号时是同一条。
+      note("订阅者太慢，总线已丢弃部分事件（累计 " + (d.dropped_total || 0) + " 条），从盘上补全…");
+      resync();
+      break;
+  }
+}
+
+function note(text) {
+  const n = el("div", "note", text);
+  $("runErrors").appendChild(n);
+}
+
+// ── 步骤卡 ────────────────────────────────────────────────
+function renderStep(s) {
+  const decisions = s.guardrail_decisions || [];
+  const blocked = decisions.some((x) => x.decision === "block");
+  const asked = decisions.some((x) => x.approved !== null && x.approved !== undefined);
+  const box = el("div", "step" + (blocked ? " blocked" : "") + (asked ? " asked" : ""));
+
+  const hd = el("div", "hd");
+  hd.appendChild(el("span", "n", "step " + s.step));
+  if (s.attempt > 1) hd.appendChild(el("span", "pill", "attempt " + s.attempt));
+  hd.appendChild(el("span", "attrs",
+    (s.duration_s || 0).toFixed(2) + "s · in " + (s.tokens_in || 0) + " / out " + (s.tokens_out || 0)));
+  if (s.actions_not_executed) {
+    // ★ 这一栏必须在动作列表**之前**：这一步的动作一个都没执行，
+    //   下面的动作列表是"打算做什么"而不是"做了什么"。
+    hd.appendChild(el("span", "pill block", "动作未执行（被中止）"));
+  }
+  if (s.same_frame_as_previous) {
+    // ★ 写的是"画面与上一步相同"这个**事实**，不是"点击无效"这个判断 ——
+    //   实测里 scroll 也会画面不变（页面比视口短），那是正常行为。
+    hd.appendChild(el("span", "pill", "画面与上一步相同"));
+  }
+  if (s.snapshot_missing) hd.appendChild(el("span", "pill", "无回调快照"));
+  box.appendChild(hd);
+
+  if (s.url) box.appendChild(el("div", "attrs", s.url + (s.title ? "  |  " + s.title : "")));
+  if (s.model_thought) box.appendChild(el("div", "thought", s.model_thought));
+
+  if ((s.actions || []).length) {
+    const ul = el("ul", "acts");
+    for (const a of s.actions) {
+      const li = el("li");
+      li.appendChild(el("span", "mono", a.name));
+      if (a.element_text) li.appendChild(el("span", null, " 「" + a.element_text + "」"));
+      else li.appendChild(el("span", "note", " （无可读文本）"));
+      const p = a.params || {};
+      const keys = Object.keys(p);
+      if (keys.length) li.appendChild(el("span", "note", "  " + JSON.stringify(p).slice(0, 160)));
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
+  }
+
+  for (const r of s.results || []) {
+    const line = el("div", "dec");
+    if (r.error) line.appendChild(el("span", "err", "✗ " + r.error));
+    else line.appendChild(el("span", "note", "✓ " + (r.is_done ? "done " : "") +
+      (r.extracted_preview ? r.extracted_preview.slice(0, 160) : "ok")));
+    box.appendChild(line);
+  }
+
+  for (const dec of decisions) {
+    // ★ 这一栏是回放与实时**共有的**：审批和拦截的结论就在每一步的载荷里。
+    //   所以回放视图不需要另做一套"决策渲染"—— 它读的是同一个字段。
+    const line = el("div", "dec");
+    const pill = el("span", "pill " + dec.decision,
+      dec.decision + (dec.rule_id ? " · " + dec.rule_id : ""));
+    line.appendChild(pill);
+    if (dec.approved === true) line.appendChild(el("span", "pill approved", "已批准 " + (dec.approved_by || "")));
+    else if (dec.approved === false) line.appendChild(el("span", "pill denied", "被拒 " + (dec.approved_by || "(无通道)")));
+    line.appendChild(el("span", "why", "  " + (dec.reason || "")));
+    box.appendChild(line);
+  }
+
+  if (s.screenshot_path) {
+    const img = el("img", "shot");
+    img.loading = "lazy";
+    img.src = "/api/runs/" + encodeURIComponent(s.run_id || S.runId) +
+              "/steps/" + s.step + "/screenshot";
+    img.alt = "step " + s.step + " 截图";
+    img.onclick = () => { $("lightbox").style.display = "flex";
+                          $("lightbox").firstChild.src = img.src; };
+    // 记录里有路径但文件不在是**正常状态**（不是 PNG 时刻意不落盘），
+    // 所以图挂了就安静移除，并留一行说明。
+    img.onerror = () => { img.remove(); box.appendChild(el("div", "note",
+      "（这一步的记录里有截图路径，但文件不在盘上 —— 不是 PNG 时 recorder 会拒绝落盘）")); };
+    box.appendChild(img);
+  }
+
+  $("timeline").appendChild(box);
+  box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+// ── 实时专属卡 ────────────────────────────────────────────
+function renderLiveBlock(d) {
+  // ★★ 这张卡**只在实时出现**，回放里没有 —— 而且这一点被明确写在卡片上。
+  //
+  //    原因不是偷懒，是回放重建不出来：被硬停中止的那一步不产生历史项
+  //    （runner 的 _make_step_hook 在"history 没变长"时会丢弃判定），
+  //    所以盘上没有它的行。非硬停的拦截在**步骤卡里那一栏**照样看得到
+  //    （它读的是 StepRecord.guardrail_decisions，回放实时都有）。
+  //
+  //    把它显式标成"仅实时可见"，而不是让它悄悄消失：
+  //    回放看起来越完整，人越会以为它是全量。
+  const box = el("div", "liveev");
+  const tag = d.hard_stop ? "⛔ 护栏硬停（run 就此终止）" : "🛡 护栏拦截";
+  box.appendChild(el("div", "tag", tag));
+  box.appendChild(el("div", null,
+    "step " + d.step + " · " + d.action_name +
+    (d.element_text ? "「" + d.element_text + "」" : "") +
+    " · 规则 " + (d.rule_id || "default")));
+  box.appendChild(el("div", "note", d.reason || ""));
+  box.appendChild(el("div", "liveonly",
+    "此卡片仅实时可见：" + (d.hard_stop
+      ? "被硬停中止的那一步不产生历史项，因此不落盘，回放里重建不出来。"
+      : "非硬停的拦截在回放里能从该步的 guardrail_decisions 读到，这里只是提前显示。")));
+  $("timeline").appendChild(box);
+}
+
+// ── 审批卡 ────────────────────────────────────────────────
+function renderApprovalCard(d) {
+  if (S.approvals.has(d.approval_id)) return;
+  S.approvals.add(d.approval_id);
+  const box = el("div", "appr");
+  box.id = "appr-" + d.approval_id;
+  box.appendChild(el("h3", null, "⚠️ 需要人工确认"));
+  const tb = el("table");
+  const rows = [
+    ["规则", (d.rule_id || "default") + " — " + (d.reason || "")],
+    ["动作", d.action_name + (d.element_text ? "「" + d.element_text + "」" : "（无可读文本）")],
+    ["参数", JSON.stringify(d.params || {})],
+    ["URL", d.url],
+    ["step", String(d.step)],
+  ];
+  for (const [k, v] of rows) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "k", k));
+    tr.appendChild(el("td", "mono", v));
+    tb.appendChild(tr);
+  }
+  box.appendChild(tb);
+  const bar = el("div", "row");
+  const yes = el("button", "ok", "批准执行");
+  const no = el("button", "bad", "拒绝");
+  yes.onclick = () => decide(d.approval_id, true, yes, no);
+  no.onclick = () => decide(d.approval_id, false, yes, no);
+  bar.appendChild(yes); bar.appendChild(no);
+  bar.appendChild(el("span", "note", "拒绝后 LLM 会收到一条说明并改道（steps.jsonl 里会出现 HUMAN_DENIED）"));
+  box.appendChild(bar);
+  $("approvals").appendChild(box);
+}
+
+async function decide(aid, approved, yes, no) {
+  yes.disabled = no.disabled = true;
+  try {
+    const r = await fetch("/api/runs/" + encodeURIComponent(S.runId) + "/approvals/" + encodeURIComponent(aid),
+      { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approved, approved_by: "web", note: "" }) });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      // ★ 409 的说明必须原样显示出来。它说的通常是"你来晚了：这条审批
+      //   已经超时了" —— 一个和"按钮坏了"完全不同、且必须被知道的事实。
+      alert("提交失败（" + r.status + "）：" + (j.detail || r.statusText));
+      yes.disabled = no.disabled = false;
+      return;
+    }
+  } catch (e) {
+    alert("提交失败：" + e); yes.disabled = no.disabled = false;
+  }
+}
+
+function resolveApprovalCard(d) {
+  const box = $("appr-" + d.approval_id);
+  if (!box) return;
+  box.classList.add("done");
+  box.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  const line = el("div", "row");
+  const cls = d.outcome === "approved" ? "approved" : "denied";
+  line.appendChild(el("span", "pill " + cls,
+    d.outcome + (d.approved_by ? " · " + d.approved_by : "")));
+  // ★ 四种结局分开显示。只有 approved/denied 是"人做出的决定"，
+  //   timeout / error 说明**审批通道本身有问题** —— 那是必须被看见的不同事实
+  //   （approver.py 的 ApprovalOutcome 特地分了四种，理由就在这条界面上）。
+  if (d.outcome === "timeout") line.appendChild(el("span", "note", "无人应答，按拒绝处理"));
+  if (d.outcome === "error") line.appendChild(el("span", "note", "审批通道故障，按拒绝处理"));
+  line.appendChild(el("span", "note", d.note || ""));
+  box.appendChild(line);
+  S.approvals.delete(d.approval_id);
+}
+
+// ── 起一个 run ────────────────────────────────────────────
+async function startRun() {
+  if (!S.template) return;
+  const btn = $("startBtn"); btn.disabled = true;
+  try {
+    const r = await fetch("/api/runs", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template_id: S.template.template_id, params: collectParams() }),
+    });
+    const j = await r.json();
+    if (!r.ok) { alert("起不来：" + (j.detail || r.statusText)); return; }
+    resetView(j.run_id);
+    openStream(j.run_id);
+    loadHistory();
+  } finally { btn.disabled = false; }
+}
+
+// ── SSE ───────────────────────────────────────────────────
+// ★ 事件名列表必须与后端 EventType 的 Literal **逐字一致**。
+//   拼错的表现是静默的：SSE 连接正常、HTTP 200、后端日志正常，
+//   只是那类事件一条都不显示。所以后端把它做成了 Literal（构造时就炸），
+//   而这里是唯一的另一处 —— 改了后端就要一起改这里。
+const EVENT_TYPES = ["run_started", "step_completed", "guardrail_blocked",
+                     "approval_required", "approval_resolved", "run_completed",
+                     "error", "stream_gap"];
+
+function openStream(runId) {
+  closeStream();
+  $("conn").className = "badge";
+  $("conn").textContent = "实时连接中…";
+  const es = new EventSource("/api/runs/" + encodeURIComponent(runId) + "/stream");
+  S.es = es;
+  es.onopen = () => { $("conn").className = "badge ok"; $("conn").textContent = "实时"; };
+  for (const t of EVENT_TYPES) {
+    es.addEventListener(t, (m) => {
+      let ev; try { ev = JSON.parse(m.data); } catch (e) { return; }
+      handleEvent({ type: t, seq: m.lastEventId ? parseInt(m.lastEventId, 10) : 0, data: ev });
+    });
+  }
+  es.onerror = () => {
+    // ★ EventSource 会自己重连，而重连会把 backlog 重发一遍 ——
+    //   去重靠 seq（见 handleEvent）。所以这里**不关连接**，只报状态。
+    //   但如果连接已经结束（服务端正常收尾或 run 失败），我们会主动 close，
+    //   那时 S.es 已经是 null，这里就不会再被调到。
+    if (!S.es) return;
+    S.reconnects++;
+    $("conn").className = "badge warn";
+    $("conn").textContent = "重连中（第 " + S.reconnects + " 次）";
+    if (S.reconnects >= 3) {
+      // 连不上三次就别再让浏览器空转了：直接从盘上补一份，并明确告诉人
+      // "这是回放，不是实时"。
+      note("SSE 连续失败 " + S.reconnects + " 次，已改为从盘上读取（下面看到的不再是实时推送）。");
+      $("conn").className = "badge warn"; $("conn").textContent = "回放（SSE 不可用）";
+      closeStream();
+      resync();
+    }
+  };
+}
+
+function closeStream(why) {
+  if (S.es) { S.es.close(); S.es = null; }
+  if (why) $("conn").textContent = why;
+}
+
+// ── 兜底：从盘上补全 ──────────────────────────────────────
+// ★★ 这条路径和"打开一条历史 run"是**同一个**函数。
+//    这不是巧合，是设计：一条事件丢了（stream_gap / seq 跳号 / SSE 挂了）
+//    和"这个 run 早就跑完了"对看板来说是同一件事 —— 都去盘上读全量。
+//    所以"补数据"没有第二套逻辑，也就没有第二套逻辑会漂移。
+async function resync() {
+  if (!S.runId || S.replaying) return;
+  S.replaying = true;
+  try {
+    const j = await (await fetch("/api/runs/" + encodeURIComponent(S.runId))).json();
+    if (!j.events) {
+      // ★ 这个 run 在盘上不存在时，这条接口回的是 404 + {detail: "找不到 run ..."}。
+      //   不特判的话下面 `j.events || []` 会安静地空转：屏幕上什么都不发生、
+      //   状态灯还写着"回放" —— 人只会以为看板坏了，而真相是这个 id 不存在
+      //   （链接过期、手输错、或者 run 被清理了）。接口是唯一知道真相的地方，
+      //   那就由它把话说出来。
+      note("读不到这个 run：" + (j.detail || JSON.stringify(j)));
+      setStatus("bad", "找不到 run");
+      return;
+    }
+    $("timeline").textContent = "";
+    $("approvals").textContent = "";
+    S.lastSeq = 0;
+    for (const ev of j.events || []) handleEvent(ev);
+    if (j.record && j.record.status) {
+      setStatus(j.record.status === "completed" ? "ok" : "bad",
+        j.record.status + " / " + (j.record.parse_status || "?") +
+        " · " + (j.record.rows_collected || 0) + " 行");
+    }
+  } catch (e) {
+    note("从盘上读取失败：" + e);
+  } finally { S.replaying = false; }
+}
+
+async function openReplay(runId) {
+  closeStream("回放");
+  resetView(runId);
+  // 先连 SSE：如果这个 run 其实还在跑（进程内），SSE 会把 backlog + 实时
+  // 一起给过来，等于白捡；如果它已经结束/进程重启过，后端会自动降级成
+  // 回放推流（见 /stream 的说明），同样是这一条路。
+  openStream(runId);
+}
+
+// ── 启动 ──────────────────────────────────────────────────
+$("startBtn").onclick = startRun;
+$("refresh").onclick = () => { loadHistory(); health(); };
+$("lightbox").onclick = () => { $("lightbox").style.display = "none"; };
+
+// ★ 从 query string 里取一个参数，**不用 URLSearchParams**。
+//   URLSearchParams 按表单语义解码：`+` 就是空格。而我们的 run_id 里
+//   **天生带 `+`**（new_run_id() 的 20260917T103341+0000-abcdef，来自 `+00:00` 时区），
+//   于是 `?run_id=20260917T103341+0000-fb79d9` 会被解成
+//   `20260917T103341 0000-fb79d9` → 服务端找不到那个目录 → 回放**静默**停在
+//   "连接中…"：不报错、不提示，看起来像服务挂了。（实测过一次，演示里就是翻车。）
+//   decodeURIComponent 只解 %XX，不碰 `+` —— 这正是这里要的语义。
+//   ⚠️ 页面里只有这一个 query 参数；以后再加参数也请走这个函数，
+//      别为了省事把 URLSearchParams 请回来。
+function queryParam(name) {
+  const m = new RegExp("[?&]" + name + "=([^&]*)").exec(location.search);
+  if (!m) return null;
+  try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }  // 坏 %XX 就别解了
+}
+
+(async function boot() {
+  await health();
+  await loadTemplates();
+  await loadHistory();
+  // ★ 支持 ?run_id=xxx 直接打开某次 run —— 回放视图就是同一份代码
+  //   （ADR 里"同一份代码加个 query 参数就变成回放"说的就是这一行）。
+  const q = queryParam("run_id");
+  if (q) openReplay(q);
+})();
+</script>
+</body>
+</html>
