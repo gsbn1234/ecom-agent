@@ -1426,3 +1426,138 @@ needs_browser 实际结果：11 passed, 318 deselected, 30 warnings in 21.26s �
 `actions/setup-python@v5` 正被强制跑在 Node 24 上。这类东西到某天会变成真红，
 而那时报错出现在 action 内部、跟我们自己的代码毫无关系。记录在此，
 下次动 CI 时顺手升版本。
+
+
+---
+
+# Phase 6 探路结论：登录态怎么才能**真的**留下来（2026-09-17）
+
+Phase 6 的目标是"人工扫码一次，之后每次 run 都是登录状态"。这件事看着像配置问题
+（传个 `user_data_dir` 就完了），实际是**一个未文档化的库行为 + 一个关闭时序**的合体 ——
+两者任一搞错，失败形态都**不是报错**，而是"报告齐全、退出码 0、零行数据"。
+这一节记的就是把它们逐条钉死的过程，全部有实测输出。
+
+## 事实 1 ★★★：`BrowserProfile` 会把 `user_data_dir` **静默改道**到临时目录
+
+`browser_use/browser/profile.py` 的 `model_post_init` 里调 `_copy_profile()`：
+
+```python
+if self.user_data_dir and self.is_chrome:      # is_chrome = 'chrome' in str(executable_path).lower()
+    tmp = tempfile.mkdtemp(prefix='browser-use-user-data-dir-')
+    shutil.copytree(self.user_data_dir, tmp, dirs_exist_ok=True, ...)
+    self.user_data_dir = tmp                  # ← 把自己的字段换掉了
+```
+
+日志只有一行岁月静好的 INFO：
+
+```
+INFO [utils] Created new profile (Default) in temp directory: C:\Users\...\Temp\browser-use-user-data-dir-xxxx
+```
+
+**为什么这一条足以让整个 Phase 6 静默失败**：
+
+```
+人工扫码成功 → cookie 写进 %TEMP%\browser-use-user-data-dir-xxxx
+             → 进程结束，临时目录消失
+             → 下一次 run 又是干净 profile → 看到登录页
+             → 按任务文本第 1 步"遇登录页立刻停止并汇报需要人工登录"
+             → 退出码 0、report.html 齐全、sqlite **零行**
+```
+
+链条上没有任何一环报错或崩溃。而人看到"需要人工登录"的第一反应是**去查风控**——
+正是计划 R2 里那条最贵的错误方向。这是「前端读一个字段、某个通道从没发过它」那个
+缺陷家族的**第五个成员**：静默、无错误、无日志（那行 INFO 看起来完全无害）。
+
+★ 它为什么会被踩到：`executable_path` 我们**永远**传 chrome.exe（playwright 缓存的
+Chrome 148），于是 `is_chrome` 恒为真 —— 这条路不是"某些情况下才走"，是**必走**。
+
+## 事实 2 ★★：`BrowserSession(browser_profile=obj)` **不使用** `obj`
+
+第一版探测脚本就是这么写的，结果两条支路**都**失败。查下去发现：
+
+```python
+session = BrowserSession(browser_profile=prof)
+session.browser_profile is prof      # → False
+```
+
+构造时它会自己造一个 profile，于是 `_copy_profile()` **又跑了一遍**。
+把 `prof.user_data_dir` 钉回原目录也没用 —— **钉在一个库根本没用到的对象上，等于没钉**。
+（这个坑我踩了一次才改对，`pin_user_data_dir` 的注释里留着。）
+
+正确姿势是**构造之后**钉在 `session.browser_profile` 上，已固化为
+`runtime/browser.py:pin_user_data_dir(session, dir)`。
+
+**被否掉的另一条路**：源码里 `_copy_profile` 有个豁免 —— 路径里含
+`browser-use-user-data-dir-` 就跳过拷贝。所以"把我自己的目录命名成那样"技术上可行。
+**不采用**：那是借一条会被收回的豁免。哪天库加一句"清理遗留的 browser-use-user-data-dir-*"
+就轮到我们的登录态被删了 —— 而且是静默的。**我的登录态不能建立在库的临时文件命名约定上。**
+
+**代价（如实记录）**：钉住之后，同一个 profile 目录不能被两个会话同时使用（Chrome 的
+profile 锁）。以前库的拷贝行为顺带避开了这个问题。`devtools/login_pdd.py` 里为此加了
+一个**大声的**重试（而不是静默等待）。
+
+## 事实 3 ★★：cookie 能不能落盘，取决于**最后怎么关浏览器**（三组对照实测）
+
+这是另一个独立的一半 —— 就算目录钉对了，cookie 也可能一个字节都没写下去。
+三组对照（同一台机器、同一个脚本，只改关闭方式）：
+
+| 关闭方式 | 盘上 `Default/Network/Cookies` 的行数 | 新会话读得到吗 |
+|---|---|---|
+| 设 cookie → 等 **35s** → `kill()` | 有 | ✔ |
+| 设 cookie → 等 2s → `session.stop()` → `kill()` | **0** | ✘ |
+| 设 cookie → 等 2s → `await session.cdp_client.send.Browser.close()` | **有（关闭后立刻）** | ✔ |
+
+机制：Chrome 的 cookie store 是**攒着批量提交**的，不是写一次落一次盘。
+所以"会话里 `document.cookie` 读得到"**不代表**盘上有 —— 实测里那个值在内存里、
+而 SQLite 表是空的。
+
+★ `session.stop()` **不算优雅退出**（这条最反直觉：名字里带 stop，看着像关干净了）。
+能用的是标准 CDP 的 `Browser.close`（公开协议，不是私有 API）。已固化为
+`runtime/browser.py:close_gracefully_and_flush()`：CDP 优雅关闭 → 等 2s → 兜底强杀；
+**CDP 关闭失败时不假装成功**，而是 WARNING 明说"cookie 可能没落盘，请以随后的新会话复核为准"。
+
+⚠️ 一条**无害但会吓人**的库噪声：`Browser.close` 之后库的
+`StorageStateWatchdog.on_SaveStorageStateEvent` 会抛
+`ConnectionError: Reconnection failed — CDP still not connected`。
+它与登录态无关（正是我们主动断的连接），但第一次看到会以为关闭失败了 ——
+写在这里，免得下次在同一个地方查半天。
+
+### 测量工具本身错了两次（比结论更值得记）
+
+- 第一次用 `dom_state.llm_representation()` 判断 cookie 在不在 —— **它不是确定性工具**
+  （那段表示里不一定包含目标元素）。换成 `page.evaluate("(arg) => document.cookie", None)`。
+- 第二次 `document.cookie` 读到了值，就以为成功了 —— 但**没带 `expires` 的是会话 cookie**，
+  退出即丢，测出来的是"会话 cookie 没了"，不是"目录不对"。
+  换成带 `expires` 的持久 cookie（真实站点的登录 cookie 也是持久的）。
+- 最后真正可信的证据是**绕开浏览器去查 SQLite**：把 `Default/Network/Cookies` 拷出来查行数。
+
+**教训**：一个结论"看起来成立"之前，先问一句"我的测量工具凭什么可信"。
+这一节三条事实里，有两条是被换掉的测量工具救回来的。
+
+## 这三条改变了哪几处设计
+
+| 改动 | 因为哪条事实 |
+|---|---|
+| `runtime/browser.py:pin_user_data_dir()`（构造后钉） | 事实 1 + 2 |
+| `runtime/browser.py:close_gracefully_and_flush()`（CDP 关 + 兜底） | 事实 3 |
+| `devtools/login_pdd.py` 的**三阶段**流程：人工登录 → **新会话复核** → 才写标记 | 事实 1/3 —— **不复核就不知道登录态到底留没留下** |
+| `runtime/profile.py:check_profile()` 把四种情况分成**四句不同的话** | 事实 1 的失败形态是静默的 → 必须让"没登录"和"配置没开"看起来不一样 |
+| `config.py:USER_DATA_DIR` 默认为**空**（无状态） | 有状态的东西不能做默认值：CI 的 13 条浏览器用例会共用一个 cookie 目录 |
+| `tasks/pdd_shop_overview.yaml`：不输入、不点击、不翻页、不重试 | R2 —— 首跑要的是**最小动作集**，把"只读"做成任务本身没有写动作，护栏只作纵深防御 |
+
+## 守卫：`tests/test_profile_persistence.py`（真浏览器，本地硬门禁）
+
+事实 1 是"有一天会变"的那类前提（库一升级就可能不成立），所以它不能只写在文档里。
+两条用例，**同一套动作、只改一个变量**：
+
+- **主判据**：钉住 → cookie 写进我们的目录 → 新会话读得回来；
+- **对照**：不钉 → cookie 进库的临时目录 → 新会话**读不到**，且我们的目录里
+  连 `Default/` 都没有（第二份独立证据，不只靠行为断言）。
+
+没有第二条，第一条在"cookie 其实写哪都留得下"的世界里也会绿。而且对照组的关闭方式
+**和主组完全相同** —— 第一版对照用的是 `kill()`，结果它红的原因是"强杀丢 cookie"
+而不是"目录不对"，两条路都红，实验什么也没说明。
+
+★ 对照组在"突然变绿"时用注释写明：那不是好消息也不是坏消息，而是
+"库改了 `_copy_profile`"的信号，**该去看 `pin_user_data_dir` 还需不需要，
+而不是删掉这条用例**。
