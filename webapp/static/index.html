@@ -304,6 +304,18 @@ function collectParams() {
 }
 
 // ── 历史 ──────────────────────────────────────────────────
+// ★★ 登录态那一小段后缀。**只在需要说话时说话**：
+//   `login_page` 是唯一会改变处置的取值（去重新扫码，而不是去查风控）；
+//   `unknown` 说一句"看不清"（该去看截图）；`logged_in` 和 ""（没探）不说话 ——
+//   每次都被念一遍的话，那句真正要紧的"落在登录页"就会被淹掉。
+//   ⚠️ 服务端两个通道（SSE 的 run_completed 与 /api/runs）都发这个字段；
+//      老 run.json 没有它 → undefined → 落到最后一个分支，安静。
+function loginSuffix(v) {
+  if (v === "login_page") return " · ⚠️ 落在登录页（不是风控）";
+  if (v === "unknown") return " · 登录态看不清";
+  return "";
+}
+
 async function loadHistory() {
   const j = await (await fetch("/api/runs")).json();
   const box = $("history"); box.textContent = "";
@@ -312,7 +324,8 @@ async function loadHistory() {
     const d = el("div", "item");
     d.appendChild(el("div", "t", r.task_name || r.task_id || r.run_id));
     const tag = r.incomplete ? "未完成（无 run.json）"
-              : (r.status || "?") + " / " + (r.parse_status || "?") + " · " + r.rows_collected + " 行";
+              : (r.status || "?") + " / " + (r.parse_status || "?") + " · " + r.rows_collected + " 行"
+                + loginSuffix(r.login_state);
     d.appendChild(el("div", "s", tag));
     d.appendChild(el("div", "s", r.run_id));
     d.onclick = () => openReplay(r.run_id);
@@ -389,7 +402,8 @@ function handleEvent(ev) {
         " · 耗时 " + (d.duration_s || 0) + "s · " + (d.attempts || "?") + " 次尝试";
       const ok = d.status === "completed";
       setStatus(ok ? "ok" : "bad", (d.status || "?") + " / " + (d.parse_status || "?") +
-                                   " · " + (d.rows_collected || 0) + " 行");
+                                   " · " + (d.rows_collected || 0) + " 行" +
+                                   loginSuffix(d.login_state));
       if (d.errors && d.errors.length) {
         const box = $("runErrors");
         for (const e of d.errors) box.appendChild(el("div", "err", "• " + e));
@@ -694,7 +708,8 @@ async function resync() {
     if (j.record && j.record.status) {
       setStatus(j.record.status === "completed" ? "ok" : "bad",
         j.record.status + " / " + (j.record.parse_status || "?") +
-        " · " + (j.record.rows_collected || 0) + " 行");
+        " · " + (j.record.rows_collected || 0) + " 行" +
+        loginSuffix(j.record.login_state));
     }
   } catch (e) {
     note("从盘上读取失败：" + e);

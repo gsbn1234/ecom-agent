@@ -709,6 +709,13 @@ def _list_run_dirs(runs: Path, *, limit: int, registry: RunRegistry) -> list[dic
                 "status": record.get("status", ""),
                 "parse_status": record.get("parse_status", ""),
                 "rows_collected": record.get("rows_collected", 0),
+                # ★★ 实测登录态。列表每一行目前显示 `status / parse_status · N 行`，
+                #   而"落在登录页"和"店里没数据"在那三个字段里长得一模一样 ——
+                #   于是一排 `completed / empty · 0 行`面前，人不知道该去重新扫码
+                #   还是本来就没什么可看。⚠️ 老 run.json 没有这两个键 → 空串，
+                #   前端按"没探过"处理（不是按"已登录"）。
+                "login_state": record.get("login_state", ""),
+                "login_state_reason": record.get("login_state_reason", ""),
                 "steps": record.get("steps", 0),
                 "started_at": record.get("started_at", ""),
                 "finished_at": record.get("finished_at", ""),

@@ -384,6 +384,54 @@ class TaskRunner:
             return
         self.events.publish(RunEvent(type=type_, run_id=self.run_id, data=data))
 
+    def _run_completed_payload(self, record: RunRecord) -> dict[str, Any]:
+        """`run_completed` 的载荷。★ 抽成方法是为了它能被**离线**测到。
+
+        ★ 为什么值得为它单开一个方法：
+          它原先是内联在 `run()` 里的一个字面量，而 `run()` 离线的代价很高
+          （要真浏览器、真 LLM、真落库），于是这个载荷**在离线测试里一次都验不到**。
+          于是它上面那些字段里，有两个的失效形态是**测不出来**的：
+
+            · 少发一个键 → 判据 8（实时与回放逐字段比）会红，还行；
+            · ⚠️ **发一个空值** → 什么都不红。回放那边从 run.json 读，
+              两边都是 `""`，逐字段比下来完全一致、绿。
+              而那正好是"前端读到了、但读到的是空的"这个家族最坏的一种 ——
+              看板上一切正常，只是那一栏什么都没说。
+
+        ★ 所以值必须能被独立断言：喂一个 `login_state="login_page"` 的 record
+          进来，载荷里就得是 `login_page`。见
+          `tests/test_runner_offline.py::test_run_completed_payload_carries_the_login_state`。
+
+        ★ `status` / `parse_status` 取自 `record` 而不是 `run()` 里的局部变量：
+          `_build_record` 就是拿那两个局部变量填进 record 的同名字段的
+          （`status=status, parse_status=parse_status`），所以两者恒等 ——
+          而取自 record 意味着这个方法的输入只有一个，它不再依赖调用点的上下文。
+        """
+        return {
+            "run_id": self.run_id,
+            "status": record.status,
+            "parse_status": record.parse_status,
+            "rows_collected": record.rows_collected,
+            "steps": record.steps,
+            "duration_s": record.duration_s,
+            # ★ 结束时刻必须发出去：看板的"结束 …"读的就是这个字段。
+            #   它原来**两个通道都没发**（回放那边手里明明有，只是没放进载荷），
+            #   于是那行永远渲染成"结束 "后面空着 —— 一个前端读了、
+            #   而生产者从来没给过的字段。
+            "finished_at": record.finished_at,
+            "attempts": self.attempts,
+            "errors": list(self.errors),
+            "run_dir": str(self.run_dir),
+            # ★★ 实测登录态。看板那行状态是 `status / parse_status · N 行`，
+            #   而"落在登录页"和"店里没数据"在那三个字段里**长得一模一样** ——
+            #   所以它必须跟着状态一起发，否则看板上看到一个 `completed / empty / 0 行`，
+            #   人会去查风控，而该做的是重新扫码。
+            #   ⚠️ 回放通道（observability/events.py）必须**同步**加这两个键 ——
+            #   两边形状不一致时，判据 8（实时与回放载荷逐字段比）会红。
+            "login_state": record.login_state,
+            "login_state_reason": record.login_state_reason,
+        }
+
     # ── LLM ───────────────────────────────────────────────
     def _resolve_llm(self) -> Any:
         """注入优先，否则构造真的。★ 计数包装在这一步统一加上。"""
@@ -593,25 +641,7 @@ class TaskRunner:
         # ★ 这里**不** close() 总线：一次 run 结束后，看板还要继续读 backlog
         #   （页面刷新、SSE 重连、以及"跑完了我再看一眼"）。关不关是 Web 层
         #   的决定，它才知道订阅者什么时候都可以收摊了。
-        self._publish(
-            "run_completed",
-            {
-                "run_id": self.run_id,
-                "status": status,
-                "parse_status": parse_status,
-                "rows_collected": record.rows_collected,
-                "steps": record.steps,
-                "duration_s": record.duration_s,
-                # ★ 结束时刻必须发出去：看板的"结束 …"读的就是这个字段。
-                #   它原来**两个通道都没发**（回放那边手里明明有，只是没放进载荷），
-                #   于是那行永远渲染成"结束 "后面空着 —— 一个前端读了、
-                #   而生产者从来没给过的字段。
-                "finished_at": record.finished_at,
-                "attempts": self.attempts,
-                "errors": list(self.errors),
-                "run_dir": str(self.run_dir),
-            },
-        )
+        self._publish("run_completed", self._run_completed_payload(record))
 
         return RunOutcome(
             run_id=self.run_id,

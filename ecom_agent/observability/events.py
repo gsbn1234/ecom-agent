@@ -439,6 +439,14 @@ def events_from_run_dir(run_dir: Path | str) -> list[RunEvent]:
                 #     于是老 run（没有这个键）显示"?"，而不是一句假的"0 次尝试"。
                 "attempts": record.get("attempt", 0),
                 "errors": record.get("errors", []),
+                # ★★ 实测登录态 —— 与实时通道（runner.py 的 run_completed）逐字段对齐。
+                #   看板那行状态是 `status / parse_status · N 行`，而"落在登录页"
+                #   和"店里没数据"在那三个字段里**长得一模一样**：看板显示
+                #   `completed / empty / 0 行`，人会去查风控，而该做的是重新扫码。
+                #   ⚠️ 老 run.json 里没有这两个键 → 取空串，前端 `|| ""` 兜住，
+                #     于是显示成"没探过"而不是一句假的"已登录"。
+                "login_state": record.get("login_state", ""),
+                "login_state_reason": record.get("login_state_reason", ""),
                 # ★ `replay: True` 是实时通道**没有**的一个字段，刻意留着：
                 #   它不是渲染需要的，是给"看板该不该显示实时状态灯"用的。
                 #   前端只读它决定一个徽标，不参与步骤渲染 ——
