@@ -50,6 +50,11 @@ class CompiledTask:
     policy: GuardrailPolicy
     fingerprint: str
     guardrail_clauses: list[str] = field(default_factory=list)
+    # ★ 卡片列表的字段判据，来自 `spec.card_fields`。
+    #   它必须**穿过编译产物**送到 runner，因为 `build_tools(card_fields=...)`
+    #   是从这里取值的 —— 判据属于任务定义，不属于采集器。
+    #   空元组 = 本任务不用 extract_cards（绝大多数任务）。
+    card_fields: tuple[Any, ...] = ()
 
     @property
     def task_id(self) -> str:
@@ -329,4 +334,7 @@ def compile_task(
         policy=GuardrailPolicy(spec.guardrails),
         fingerprint=compute_fingerprint(spec, resolved_params),
         guardrail_clauses=clauses,
+        # ★ 从 spec 复制过来。**不能**只留在 spec 里：runner 只拿得到 CompiledTask，
+        #   而 build_tools 需要它 —— 少这一行就是"某个通道从没发过这个字段"那个家族。
+        card_fields=tuple(spec.card_fields),
     )

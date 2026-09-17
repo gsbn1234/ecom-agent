@@ -119,6 +119,50 @@ class AgentSpec(BaseModel):
         return v
 
 
+class CardField(BaseModel):
+    """卡片列表里的一个字段：**怎么从一张卡里认出它**。
+
+    ★★ 这个类型是"字段判据写进任务定义"这条设计的载体。它住在 DSL 里而不是
+      住在 action 里，因为它是**可 review、可 diff、可单测的任务定义**的一部分，
+      而不是某个采集器的私有参数 —— 采集器只是执行它。
+
+    ★ 为什么判据由这里给、而不是由 LLM 填 action 参数：
+      让模型每次现写一遍正则，等于把"哪一行算价格"交回给它，而那正是本项目
+      拒绝的事（价格/库存不该由模型转录，见 actions/extract_table.py 顶部）。
+      判据走闭包进 action，于是模型能决定的只有"读第几组、读多少"。
+      —— 与"护栏条款不由 LLM 说了算"是同一条纪律。
+
+    ★ 为什么是正则而不是"第几行"：
+      行号会随徽标/活动标签的增删而漂移，而漂移的表现是**静默取错**
+      （把"热度 100"当成价格 —— 那是个长得完全合法的数）。
+      正则要么匹配上、要么匹配不上；匹配不上的会累积成 missing 计数显示出来，
+      失败因此是**看得见**的。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, description="字段名，会作为键出现在结果的行字典里")
+    pattern: str = Field(
+        min_length=1,
+        description="对卡片文本**逐行**匹配的正则。有捕获组就取第 1 组，没有就取整个匹配。",
+    )
+
+    @field_validator("pattern")
+    @classmethod
+    def _pattern_must_compile(cls, v: str) -> str:
+        """★ 正则编译不过必须在**加载期**报出来。
+
+        放到运行期报的代价：浏览器已经起来、token 已经开始烧，而报错会变成
+        "采集器执行失败" —— 它指向采集器，真正的错处却是 YAML 里的一个括号。
+        这里挡下来，错误信息里直接带着那段正则。
+        """
+        try:
+            re.compile(v)
+        except re.error as exc:
+            raise ValueError(f"正则编译不过（{exc}）：{v!r}") from exc
+        return v
+
+
 class TaskSpec(BaseModel):
     """一份完整的任务模板。对应一个 YAML 文件。"""
 
@@ -143,6 +187,36 @@ class TaskSpec(BaseModel):
     observability: ObservabilitySpec = Field(default_factory=ObservabilitySpec)
     agent: AgentSpec = Field(default_factory=AgentSpec)
     guardrails: GuardrailSpec = Field(default_factory=GuardrailSpec)
+
+    # ★ 卡片列表类页面的字段判据（见 CardField）。**空 = 本任务不用 extract_cards**，
+    #   于是一份没有卡片列表的任务（绝大多数）完全不受这个字段影响。
+    card_fields: list[CardField] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _card_fields_are_consistent(self) -> "TaskSpec":
+        """两条：字段名不能重名；声明了判据就必须在步骤里指名用 extract_cards。
+
+        ★★ 第二条挡的是一类静默失效：YAML 里郑重写了三行判据，而**没有任何一步
+          指示 LLM 去用那个采集器**。于是模型大概率改用库内置的 `extract`
+          —— 那是 LLM 中介的，价格会被它转录一遍，而产物里一切正常。
+          那份 card_fields 就成了"躺在 YAML 里从来没生效过"的死配置。
+
+          ⚠️ 动作名写进步骤是**同一条规矩的延续**：护栏规则的 match_action 里也得写
+             动作名，而动作名 = 函数名（见 extract_table.py 的 EXTRACT_TABLE_ACTION）。
+             这条校验不检查"步骤写得对不对"，只检查"那个名字出现过没有"。
+        """
+        names = [f.name for f in self.card_fields]
+        dup = sorted({n for n in names if names.count(n) > 1})
+        if dup:
+            raise ValueError(f"card_fields 里字段名重复：{dup} —— 结果的行字典会互相覆盖")
+
+        if names and not any("extract_cards" in s for s in self.steps):
+            raise ValueError(
+                f"声明了 card_fields（{names}）但没有任何一步提到 extract_cards。"
+                "把动作名写进某一步（例如「用 extract_cards 读取卡片列表」）—— "
+                "否则这份判据不会被用上，而 LLM 会改用库内置的 extract（那会转录价格）。"
+            )
+        return self
 
     @field_validator("schema_version")
     @classmethod

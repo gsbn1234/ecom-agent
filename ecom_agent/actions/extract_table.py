@@ -220,6 +220,13 @@ def _decode_table_payload(raw: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+# ★ 公开别名：`extract_cards` 也要解同一个东西（同一个契约反转、同一份实现）。
+#   为什么不在那边再抄一遍：两份"看着一模一样"的解码器会各自演化，
+#   于是两个采集器对同一个页面的行为出现差异，而差异的原因无从查起
+#   —— spike_lib.py 顶部记过同一条教训（转出而不是拷贝）。
+decode_eval_payload = _decode_table_payload
+
+
 async def extract_table_impl(
     params: ExtractTableAction,
     browser_session: BrowserSession,

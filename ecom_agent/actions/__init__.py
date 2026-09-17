@@ -21,6 +21,13 @@ from __future__ import annotations
 
 from browser_use import Tools
 
+from ecom_agent.actions.extract_cards import (
+    CARDS_ACTION,
+    ExtractCardsAction,
+    extract_cards_impl,
+    register_extract_cards,
+    verify_extract_cards_round_trip,
+)
 from ecom_agent.actions.extract_table import (
     EXTRACT_TABLE_ACTION,
     ExtractTableAction,
@@ -34,22 +41,31 @@ from ecom_agent.actions.guard_gate import (
     register_guard_notice,
     verify_notice_round_trip,
 )
+from ecom_agent.dsl.models import CardField
 
 __all__ = [
+    "CARDS_ACTION",
     "EXTRACT_TABLE_ACTION",
     "GUARD_NOTICE_ACTION",
+    "CardField",
+    "ExtractCardsAction",
     "ExtractTableAction",
     "build_tools",
+    "extract_cards_impl",
     "extract_table_impl",
     "make_notice_action",
+    "register_extract_cards",
     "register_extract_table",
     "register_guard_notice",
+    "verify_extract_cards_round_trip",
     "verify_extract_table_round_trip",
     "verify_notice_round_trip",
 ]
 
 
-def build_tools(*, exclude_actions: list[str] | None = None) -> Tools:
+def build_tools(
+    *, exclude_actions: list[str] | None = None, card_fields: "list[CardField] | None" = None
+) -> Tools:
     """造一个 Tools 实例，注册本项目的**全部**自定义 action。
 
     ★ 必须在**构造 Agent 之前**调用，并把结果通过 `Agent(tools=...)` 传进去。
@@ -57,7 +73,12 @@ def build_tools(*, exclude_actions: list[str] | None = None) -> Tools:
       （`AgentOutput.type_with_custom_actions(self.ActionModel)`，`service.py:786-790`）。
       注册晚了，那个模型里就没有对应的字段，注入动作时抛 ValidationError
       —— 那是**好事**（报错而不是静默），但报错发生在 run 已经跑起来之后。
-      所以启动期还要各查一次：`verify_notice_round_trip()`、`verify_extract_table_round_trip()`。
+      所以启动期还要各查一次：`verify_notice_round_trip()`、
+      `verify_extract_table_round_trip()`、`verify_extract_cards_round_trip()`。
+
+    ★★ `card_fields` 是从**任务定义**（`CompiledTask.card_fields`）传进来的，
+      不是这里写死的：字段判据属于任务，不属于采集器。它走闭包进 action，
+      于是 LLM 只读 —— 见 actions/extract_cards.py 顶部的说明。
 
     ★★ 为什么每个 action 由自己的模块提供 `register_xxx(tools)`，
       而不是在这里直接写 `@tools.action(...)`：
@@ -69,4 +90,5 @@ def build_tools(*, exclude_actions: list[str] | None = None) -> Tools:
     tools = Tools(exclude_actions=list(exclude_actions or []))
     register_guard_notice(tools)
     register_extract_table(tools)
+    register_extract_cards(tools, fields=list(card_fields or []))
     return tools

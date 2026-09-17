@@ -29,7 +29,11 @@ from typing import Any, Iterable
 from pydantic import ValidationError
 
 from ecom_agent import compat
-from ecom_agent.actions import build_tools, verify_extract_table_round_trip
+from ecom_agent.actions import (
+    build_tools,
+    verify_extract_cards_round_trip,
+    verify_extract_table_round_trip,
+)
 from ecom_agent.config import DB_PATH, LIVE_LLM, RUNS_DIR
 from ecom_agent.dsl.compiler import CompiledTask
 from ecom_agent.guardrails.interceptor import GuardrailInterceptor
@@ -461,7 +465,9 @@ class TaskRunner:
             raise PreflightError(f"任务配置有问题，未启动浏览器：{problem}")
 
         llm = self._resolve_llm()
-        tools = build_tools()
+        # ★ card_fields 从编译产物里取（它来自任务定义的 YAML）—— 见 compiler.py 的
+        #   CompiledTask.card_fields。判据属于任务，所以走这条路进 action 的闭包。
+        tools = build_tools(card_fields=list(self.compiled.card_fields))
 
         # ★ 启动自检：**真的按库的方式调一次** extract_table，接线不通就当场死。
         #   放在这里而不是测试里，理由与 interceptor 的停机回调自检相同 ——
@@ -473,6 +479,11 @@ class TaskRunner:
         #      时，它在【唯一的生产路径上】一次都没跑成过。细节见
         #      extract_table.py 里 verify_extract_table_round_trip 的说明。
         await verify_extract_table_round_trip(tools)
+        # ★ extract_cards 同样自检，且**必须把 fields 传进去**：传空的话实现会走
+        #   "没配 card_fields"那条分支并返回一条**合法**的 error，于是门禁在任何
+        #   情况下都通过 —— 包括"闭包根本没接上"的情况。完整理由见
+        #   extract_cards.py 的 verify_extract_cards_round_trip。
+        await verify_extract_cards_round_trip(tools, fields=list(self.compiled.card_fields))
 
         for rule_id, action_name in unrunnable_rule_actions(self.compiled, tools):
             logger.warning(
