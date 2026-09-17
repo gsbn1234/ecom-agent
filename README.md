@@ -5,20 +5,26 @@
 不改动 browser-use 源码 —— 把它当执行引擎，上层包自己的业务逻辑：任务 DSL、三层安全护栏、
 结构化落库、逐步可观测与回放。首个适配平台是拼多多商家后台（`mms.pinduoduo.com`）。
 
-> 🚧 施工中。当前进度：**Phase 0–6 已完成**（骨架 / DSL + 护栏策略 / 真浏览器探路 /
-> 可观测与落库 / mock 站点 e2e + CI / Web 看板 / 真站点首跑）；
-> **Phase 7 进行中** —— ADR 已定稿，「护栏实战」改了口径（用**可重跑**的 mock e2e 证据，
-> 不对真站点做写操作）。
+> ✅ **Phase 0–7 全部写完**（骨架 / DSL + 护栏策略 / 真浏览器探路 / 可观测与落库 /
+> mock 站点 e2e + CI / Web 看板 / 真站点首跑 / README + ADR 定稿）。
+> Phase 7 的「护栏实战」改了口径：用**可重跑**的 mock e2e 证据，不对真站点做写操作；
+> **没做到的部分单列在文末**（不是藏起来，是有边界 —— 六条，条条可核对）。
 >
 > 文档：[`docs/ADR.md`](docs/ADR.md)（**16 条架构决策，面试主战场**）、
 > [`docs/spikes.md`](docs/spikes.md)（探路实测结论 + 逐条判据 + CI 排查全程）、
 > [`docs/guardrail_design.md`](docs/guardrail_design.md)（三层护栏各能挡什么、**挡不住什么**）。
 >
 > 测试现状：**411 条 = 394 条离线（CI 硬门禁）+ 17 条 `needs_browser`（本地硬门禁）**。
-> 最近一次推送（`68b1edb` = CI #31）两个 job 全绿，且浏览器 job 带的是**真绿**注解：
+> **ADR/README 定稿那次推送 = [`de1ac57`](https://github.com/gsbn1234/ecom-agent/commit/de1ac57)，
+> CI run [`35233757564`](https://github.com/gsbn1234/ecom-agent/actions/runs/35233757564)
+> 两个 job 全绿**，且浏览器 job 是真绿 —— gate 走的是「**测试绿**」那条分支，
+> 不是「环境不可用被放行」那条（两者**颜色完全一样，只有注解分得开**）：
 > `needs_browser 实际结果：17 passed, 394 deselected ；退出码 0` + `探针结论：环境可用`。
 >
-> ⚠️ 上面这几个数字是 `uv run pytest --collect-only` 数出来的，**不是** `uv run pytest` ——
+> ⚠️ 这里**点名 commit，不写"最近一次推送"** —— 后者每推一次就自动过期一次，
+> 而这句话在这之前已经过期过三次了。
+>
+> ⚠️ 上面那几个数字是 `uv run pytest --collect-only` 数出来的，**不是** `uv run pytest` ——
 > 后者默认**包含** `needs_browser`。这个位置**已经因为同一个原因错过两次**，所以把
 > "怎么数的"写在这里，而不是指望下次还记得。
 
