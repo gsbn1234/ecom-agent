@@ -58,21 +58,54 @@ _PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
     _p("id_card", r"(?<!\d)\d{17}[\dXx](?!\d)"),
     # 会话/凭证类：键名保留，只盖值
     _p("token", r"(?i)\b(?:bearer|token|api[_-]?key|access[_-]?key|secret)\b\s*[:=]\s*[\"']?([A-Za-z0-9._\-]{12,})", 1),
-    # ★★ 授权头的「方案 + 空白 + 凭证」形态（2026-09-17 补，补的是上一条的缺口）：
+    # ★★ 授权头的「方案 + 空白 + 凭证」形态（2026-09-17 补 bearer，2026-09-18 扩到三种 scheme）：
     #    上一条要求 `[:=]` 出现在关键字**之后**，而规范头部
     #    `Authorization: Bearer <token>` 里冒号在 `Bearer` **之前** →
     #    `bearer` 分支对它的规范形态一个字都不盖；而 `token:` / `api_key=` 是好的，
     #    所以它**看起来在工作** —— 正是本模块 docstring 警告过的那种失效。
     #
-    # ★ 为什么锚在头名上，而不是写成笼统的「bearer + 空白 + 值」：
+    # ★ 为什么是这三种 scheme：`Authorization` 头里**真正会带凭证**的就是它们。
+    #    · `Bearer`（RFC 6750，OAuth2 / JWT）—— 值多为 base64url，字母表含 `.` `-`；
+    #    · `Basic`（RFC 7617）—— 值是 `base64(user:password)`，**标准** base64，
+    #      比上面多 `+` `/`，末尾还可能带 `=` 填充。本机实测（不是推演）：
+    #      `Authorization: Basic dXNlcjpwYXNz+dmVy/abc=` 在只认 bearer 字母表的规则下
+    #      **一个字都不盖** —— 所以字符类必须取并集，而不是沿用原来那个。
+    #      两种编码长得像、字母表不同，这正是这条缺口当初没被顺手修掉的原因。
+    #    · `Token`（DRF `TokenAuthentication`）—— 值是 40 位十六进制。
+    #    三者**同处一个语法位置**（RFC 7235 §2.1：scheme 是个 token，凭证跟在它后面），
+    #    所以是**一条**规则，不是三条。
+    #
+    # ★ 为什么锚在头名上，而不是写成笼统的「scheme + 空白 + 值」：
     #   后者会误伤真实散文。本机实测（不是推演）：
     #       "error: Bearer authentication is required"
     #     → "error: Bearer <REDACTED:token> is required"   把 authentication 当凭证盖了
     #   `authentication` 有 14 个字符、又全在字符类里，所以它**必然**命中。
-    #   锚在 `authorization:` 之后，副作用面几乎为零，而本次要修的形态**恰好**在那里。
-    #   代价：不在头部、单说一句 `Bearer <值>` 的地方（比如 JSON 体里的字段）仍不盖 ——
-    #   那种形态等真见到再补，或者走 YAML 的 redact_extra，不在这里猜。
-    _p("token", r"(?i)\b(?:proxy-)?authorization\s*:\s*bearer\s+[\"']?([A-Za-z0-9._\-]{12,})", 1),
+    #   锚在 `authorization:` 之后，副作用面几乎为零，而要修的形态**恰好**在那里。
+    #
+    # ⚠️ 锚了头名之后**还剩一个残差**，本轮实测：头名之后坐着一个纯小写英文词时仍会被盖 ——
+    #    `Authorization: Basic authentication is required`
+    #      → `Authorization: Basic <REDACTED:token> is required`
+    #    ⚠️ 它**不是这次引入的**：`Authorization: Bearer authentication is required`
+    #    在 2026-09-17 那条规则下就已经命中，这次只是同一形状从 1 个 scheme 扩到 3 个。
+    #    代价是审计日志里少一个英文虚词；收益是三种真实凭证都盖住了 —— 这个交换是划算的。
+    #    ★ 想消掉它的那次尝试**实测失败了**，记在这里免得后人再走一遍：
+    #      思路是加一条前瞻，要求「值里至少含一个非小写字符」（凭证是 base64/hex，不透明；
+    #      上面那几个英文虚词全是小写）—— 但本规则带 `(?i)`，而
+    #      **`re.IGNORECASE` 会把 `[A-Z]` 变成 `[A-Za-z]`**，判别信号被规则自己的旗标
+    #      中和掉了，前瞻恒真、等于没加（12 条真实凭证全盖住，5 条散文也全盖住）。
+    #      要救得写 `(?-i:...)` 局部关旗标 —— 为省一个英文虚词，换来一个"旗标可以局部
+    #      反转"的隐性前提，不划算。**所以残差留着、并明写。**
+    #    守卫：tests/test_sanity_and_pii.py 里有一条**以「已知代价」命名**的用例钉着它。
+    #
+    # 代价（与 2026-09-17 那条同源，未变）：不在头部、单说一句 `Bearer <值>` 的地方
+    #   （比如 JSON 体里的字段）仍不盖 —— 那种形态等真见到再补，或者走 YAML 的
+    #   redact_extra，不在这里猜。
+    _p(
+        "token",
+        r"(?i)\b(?:proxy-)?authorization\s*:\s*(?:bearer|basic|token)\s+"
+        r"[\"']?([A-Za-z0-9._\-+/]{12,}={0,2})",
+        1,
+    ),
     _p(
         "cookie",
         r"(?i)\b(?:sessionid|session_id|sess_id|csrf[_-]?token|_csrf|antiforgery)\b\s*[:=]\s*[\"']?([A-Za-z0-9._\-]{8,})",

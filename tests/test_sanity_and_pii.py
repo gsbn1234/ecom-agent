@@ -8,10 +8,12 @@
     · `Authorization: Bearer <token>` 这个**最常见的凭证形态**不在脱敏规则的射程内。
       ✅ **2026-09-17 已修**（`redact.py` 加了一条锚在头名上的规则）。当时先钉的是
       `strict xfail`，修完它变成 XPASS 主动失败提醒删标记 —— 这个流程本身跑通了。
-      ⚠️ 注意"已修"的射程：**只覆盖头部形态**。`Authorization: Basic <base64>` 和
-      DRF 的 `Authorization: Token <key>` 是同一族缺口的另外两个实例，**都还是漏的** ——
-      ⚠️ **本文件里没有它们的守卫**（故意没顺手加，是射程决定），别以为在这测过了；
-      现状记在 README 缺口第 2 条与 `docs/guardrail_design.md` 的「落盘脱敏的失效边界」一节。
+      ✅ **2026-09-18 补齐**：`Authorization: Basic <base64>` 与 DRF 的
+      `Authorization: Token <key>` 这两个同族实例也盖住了，守卫就在下面
+      （含**字符类**那条，和一条**以「已知代价」命名**的用例）。
+      补之前本文件里确实没有它们的守卫，README 缺口第 2 条那两行
+      「仍一个字都不盖」曾是**唯一一处「文档说了、机制没跟上」** —— 现在收口了。
+      ⚠️ 射程**没变**：仍**只覆盖头部形态**，不在头部、单说一句 `Bearer <值>` 的地方不盖。
 
 ★ 这里测不到什么，先说清楚（与 `test_extract_cards.py` 同一条纪律）：
   这些 flag **报得对不对**，单测判不了 —— 它只判「哪个字符串在什么条件下出现、
@@ -26,6 +28,13 @@
   · `_literals` 的 `reverse=True` 去掉 → 长值优先那条红（会剩半个"铺"字）；
   · `"suspicious": int(bool(flags))` 改成 `0` → `test_suspicious_is_one_when_a_sanity_flag_fires` 红；
   · `_product_payload` 的 `"title": row.title` 改成过一遍 `Redactor` → 保真那条红。
+
+★ 补 `Basic` / `Token` 时（2026-09-18）又跑了**四条**，也都先断言了锚点命中次数：
+  · scheme 列表里删掉 `basic` → "三种 scheme 都盖住"那条红；
+  · 字符类收回 bearer 的字母表（去掉 `+ / =`）→ base64 那条红；
+  · 去掉 `={0,2}` 填充（`==` 留在盘上 = 半截凭证）→ "三种 scheme 都盖住"那条红；
+  · 锚点拆成不带头名的笼统形态 → "散文不许被盖"那条红。
+  两批加起来 **10 条**，每条都还原后复核过 md5。
 
 ★ 写这个文件时我被自己绊了一次，留在这里当反面教材：第一版断言
   `redaction_counts_json == {"literal": 2}`，因为"洗了 2 处"是肉眼可见的事实 ——
@@ -493,7 +502,117 @@ def test_a_short_value_after_bearer_is_left_alone():
 
 
 def test_the_bearer_rule_counts_under_the_token_kind():
-    """计数必须并进 `token` 这个 kind —— 报告与看板上它就是"盖了几处凭证"。"""
+    """计数必须并进 `token` 这个 kind —— 报告与看板上它就是"盖了几处凭证"。
+
+    ★ 三种 scheme 走的是**同一条** `_p` 条目，所以计数必然合并；
+      下面 `Basic` / `Token` 那几条也各自带了 counts 断言，是同一个理由。
+    """
     r = Redactor()
     r.text("Authorization: Bearer abc123def456ghi789xyz")
     assert r.counts == {"token": 1}
+
+
+# ── 同一族的另外两个实例：Basic / Token（2026-09-18 补）─────────
+def test_basic_and_token_scheme_headers_are_redacted():
+    """★ 这一族漏着的两条，2026-09-18 补上。
+
+    ⚠️ 补之前**本文件里没有它们的守卫** —— 文件头当时明写"故意没顺手加，
+      别以为在这测过了"。也就是说 README 缺口表里那两行「仍一个字都不盖」
+      是**文档说了、机制没跟上**，而且是全仓库**唯一**一处。现在两侧对齐。
+
+    三种 scheme 的字母表**真的不同**（理由在 `redact.py` 的注释里）：
+    `Basic` 是标准 base64，多 `+ / =`；`Bearer` 是 base64url，多 `. -`。
+    """
+    cases = {
+        # Basic：base64(user:password)，三种典型字母表
+        "Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l":
+            "Authorization: Basic <REDACTED:token>",
+        "Authorization: Basic dXNlcjpwYXNzd29yZA==":
+            "Authorization: Basic <REDACTED:token>",
+        "Authorization: Basic dXNlcjpwYXNz+dmVy/abc=":
+            "Authorization: Basic <REDACTED:token>",
+        # DRF TokenAuthentication：40 位十六进制
+        "Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b":
+            "Authorization: Token <REDACTED:token>",
+        # 头名大小写不敏感、`proxy-` 前缀（代理场景下真的会出现）
+        "authorization: basic YWxhZGRpbjpvcGVuc2VzYW1l":
+            "authorization: basic <REDACTED:token>",
+        "Proxy-Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l":
+            "Proxy-Authorization: Basic <REDACTED:token>",
+    }
+    for text, want in cases.items():
+        # ★ 先证明输入确实含真值 —— 否则下面那条断言可能只是"本来就没东西可盖"（恒真空转）
+        secret = text.split()[-1]
+        assert len(secret) >= 12 and secret in text
+        assert Redactor().text(text) == want, f"没盖住：{text!r}"
+
+    r = Redactor()
+    r.text("Authorization: Basic dXNlcjpwYXNz\nAuthorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b")
+    assert r.counts == {"token": 2}, f"两种 scheme 应并进同一个 kind：{r.counts}"
+
+
+def test_the_scheme_rule_keeps_basic_base64_symbols():
+    """★ 这条钉的是**字符类**，不是锚点 —— 也就是这次最容易修错的地方。
+
+    把字符类收回 `Bearer` 那个字母表（去掉 `+ / =`）→ 这条必红。
+    它不是"顺手多写几个字符"：`+` `/` `=` 是标准 base64 的**正常输出**，
+    而在 `Bearer` 用的 base64url 里这两个符号**根本不会出现**。
+    两种编码长得像、字母表不同 —— 这正是本条缺口当初没被顺手修掉的原因。
+    """
+    secret = "dXNlcjpwYXNz+dmVy/abc="
+    text = f"Authorization: Basic {secret}"
+    assert secret in text
+
+    out = Redactor().text(text)
+
+    assert out == "Authorization: Basic <REDACTED:token>", (
+        f"base64 里的 + / = 让值被截断了，盘上留了半截真凭证：{out!r}"
+    )
+    # ★ 逐字符复核：值里的每一个符号都不许剩。只盖到 `+` 之前是**最坏**的形态 ——
+    #   它看起来像"盖成功了"，实际留下一截可直接使用的凭证。
+    for ch in "+/=":
+        assert ch not in out, f"{ch!r} 还留在产物里：{out!r}"
+
+
+def test_the_legacy_token_forms_still_work():
+    """回归：新的头名规则不能把已有的 `token=` / `token: ` 形态挤掉。
+
+    与 `test_the_legacy_bearer_forms_still_work` 同一条纪律 —— 两种形态各走各的规则
+    （一条认 `[:=]`、一条认头名 + 空白），两条路都要有钉子，免得"修一处、坏一处"。
+    ⚠️ DRF 的 `Token` 这个 scheme 名正好和上面那条关键字规则**同名**，
+      所以这条回归尤其必要：多 scheme 之后最容易坏的就是它。
+    """
+    secret = "9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b"
+    assert Redactor().text(f"token={secret}") == "token=<REDACTED:token>"
+    assert Redactor().text(f"token: {secret}") == "token: <REDACTED:token>"
+
+
+def test_the_prose_over_redaction_after_the_header_is_a_known_cost():
+    """⚠️ **这条以「已知代价」命名 —— 它断言的是一个不想要的行为。**
+
+    `Authorization: <scheme> authentication is required` 里的 `authentication`
+    （14 个字符、全小写字母、全在字符类里）会被当成凭证盖掉。
+    锚头名挡不住它：这次**头名是对的**，坐错位置的是值。
+
+    ★ 为什么写成测试，而不是只写进文档：
+      · 只写文档 → 它是一处**安静的错误行为**，读代码的人根本看不到；
+      · 写成"期望它被盖"的普通用例 → 把错的行为固化成"对的"，更糟；
+      · 命名成「已知代价」→ 后人真去修了它，这条会红，然后被迫读上面这段话，
+        再决定是删掉这条、还是改规则。**这样红得有信息量。**
+
+    ★ 它**不是本次引入的**：`Authorization: Bearer authentication is required`
+      在 2026-09-17 那条规则下就已经命中，这次只是同一形状从 1 个 scheme 扩到 3 个。
+      `redact.py` 里还记了一次**想消掉它但实测失败**的尝试（`(?i)` 会把 `[A-Z]`
+      变成 `[A-Za-z]`，前瞻判别信号被自己的旗标中和）—— 别再走一遍。
+    """
+    for scheme in ("Bearer", "Basic", "Token"):
+        text = f"Authorization: {scheme} authentication is required"
+        assert (
+            Redactor().text(text) == f"Authorization: {scheme} <REDACTED:token> is required"
+        ), f"残差变了？{scheme} 这条的处理方式与记录不符"
+
+    # ★ 反面同框：**没有头名**的同一句话不许被盖。
+    #   这才是"锚头名"真正保住的那半边 —— 两半摆在一起才看得出这是个非对称的取舍，
+    #   而不是"规则没写好"。谁哪天把锚点拆松，这里会红。
+    bare = "error: Bearer authentication is required"
+    assert Redactor().text(bare) == bare
