@@ -346,6 +346,54 @@ def test_unreachable_text_rules_flags_elementless_actions(books):
     assert R.unreachable_text_rules(books, _tools()) == []
 
 
+# ── A3. 把上面两条检查**对着仓库里每一个模板**跑一遍 ────────
+#   ★ 为什么还缺这一条：A1/A2 都是"拿某一个模板去验检查能力"。
+#     而"**新加的模板**里躺着死条目"只有真遍历所有模板才拦得住 ——
+#     否则它要等某天启动自检刷屏才被发现，或者永远不被发现
+#     （自检只在**跑那个模板**时触发，而有的模板一年也跑不了一次）。
+REQUIRED_PARAMS: dict[str, dict[str, Any]] = {
+    # 模板文件名 → 让它能编译出来的最小参数。
+    # ★ 必填参数缺失时 compile_task 会直接抛 ParamError —— 这是**故意的**：
+    #   新加一个模板就必须在这里写一行，等于强制"每个模板至少被编译过一次"。
+    "books_demo.yaml": {},
+    "mock_shop_readonly.yaml": {},
+    "mock_shop_write_confirm.yaml": {},
+    "pdd_search_products.yaml": {"keyword": "保温杯"},
+    "pdd_shop_overview.yaml": {},
+}
+
+
+def test_every_shipped_template_compiles_and_has_no_dead_rules():
+    """★★ 仓库里**每一个**模板：能加载、能编译、没有永不命中的护栏条目。
+
+    ★ 注意第一段断言的是**覆盖范围本身**（`found == set(REQUIRED_PARAMS)`）。
+      没有这一半的话，新加一个模板而忘了在这里登记，这条用例会**安静地少查一个
+      文件** —— 那正是它要防的失败形态，只是换了个地方发生。
+      这和"只断言默认没有、不断言给定时有"是同一类错误（见 test_dsl.py 的
+      `test_user_data_dir_only_passed_when_nonempty`）。
+
+    ★ 为什么这条值得存在，而不是靠"我写模板时看过一眼"：
+      Phase 4 查出过 5 条躺在三份模板里、永远不会命中的护栏条目，
+      而它们的后果不是"少拦了危险动作"，是**模板声称的意图 ≠ 实际策略**。
+      这类缺陷读 YAML 看不出来 —— 只能靠跑。
+    """
+    found = {p.name for p in TASKS_DIR.glob("*.yaml")}
+    assert found == set(REQUIRED_PARAMS), (
+        f"tasks/ 下的模板与这里的清单对不上 —— 多了 {sorted(found - set(REQUIRED_PARAMS))}，"
+        f"少了 {sorted(set(REQUIRED_PARAMS) - found)}。新增模板请在 REQUIRED_PARAMS 里登记一行。"
+    )
+
+    for name, params in sorted(REQUIRED_PARAMS.items()):
+        spec = load_task(TASKS_DIR / name)      # 加载期校验：extra=forbid / 占位符 / version
+        compiled = compile_task(spec, params)   # 参数强制 + 策略编译
+        assert R.unrunnable_rule_actions(compiled, tools=_tools()) == [], (
+            f"{name}：有规则指向了不存在的动作"
+        )
+        assert R.unreachable_text_rules(compiled, _tools()) == [], (
+            f"{name}：有永不命中的护栏条目（动作不针对元素，却写了 match_element_text）"
+        )
+
+
 def test_unreachable_text_rules_gives_up_when_it_cannot_know(books):
     """★ 读不到注册表 → 返回空，而不是"每条带文本的规则都报警"。
 

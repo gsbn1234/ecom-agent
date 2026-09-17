@@ -1,0 +1,160 @@
+# 拼多多商家后台 —— **第一次真站点跑通**专用模板（只读，零点击）
+#
+# ★ 为什么要在 pdd_search_products.yaml 之外另起一份：
+#   那份模板要"在搜索框输入关键词 → 点搜索 → 可能选状态筛选 → 按分页翻最多 3 页"。
+#   步骤多 = LLM 的自由发挥空间大 = 真站点上的炸半径大，而 Phase 6 的目标只是
+#   「在真实后台里读出 5 行真数据，并且在报告里留下真实截图」。
+#   所以这一份刻意做到**最小动作集**：
+#
+#     · 不输入任何文字（连搜索框都不碰 —— 也就不会按回车，不会触发任何提交）
+#     · 不点击任何东西（表格是 extract_table 读的，不是点出来的）
+#     · 不翻页（max_pages=1）
+#     · 不重试（max_attempts=1）—— 计划里的 R2：**可能因风控失败，失败不恋战**
+#
+#   换句话说：这份模板的"只读"不是靠护栏拦出来的，而是**任务本身没有任何写动作**。
+#   护栏在这里是纵深防御，不是唯一依靠 —— 这个区别在面试里值得说清楚。
+#
+# ★ 它和 mock_shop_readonly.yaml 的分工：
+#   mock 那份验的是"护栏/提取/落库端到端成立"（零网络、CI 可跑）；
+#   这一份验的是"同一套东西在真站点上也成立"（要人工登录、可能被风控，不进 CI）。
+
+schema_version: "1"
+id: pdd.shop_overview
+name: 拼多多商家后台 - 商品列表只读采集（首跑最小动作集）
+site: pinduoduo
+
+requires_login: true
+start_url: "https://mms.pinduoduo.com/goods/goods_list"
+
+goal: >-
+  读取商品管理列表页当前这一页的商品数据，最多提取 {limit} 条，
+  每条读取商品ID、商品标题、售价、库存、状态五个字段。
+
+steps:
+  # ★ 第一条永远是"遇到登录页就停"。因为 profile 失效是一件**会静默发生**的事，
+  #   而 agent 擅自"尝试登录"是最坏的反应（它会在真站点上乱输、乱点，
+  #   既可能撞风控，也确实越过了本项目"agent 永不碰登录表单"的线）。
+  - "确认在商品管理列表页。若出现登录页或扫码页，立刻停止并调用 done 汇报'需要人工登录'，不要尝试输入账号密码。"
+  - "用 extract_table 读取页面上的商品表格，不要凭记忆抄写，也不要自己编造数据。"
+  # ★ 下面这两条对 LLM 来说是"负向指令"，通常不够可靠 —— 但它们不是本任务
+  #   安全的**依靠**：护栏（block-destructive / confirm-edit / default=confirm）
+  #   才是。写在这里是为了让 LLM 的默认行为尽量靠近，减少被拦的次数。
+  - "只读：不要点击任何按钮，包括'编辑''删除''批量删除''下架''上一页''下一页''筛选'。"
+  - "整个过程中不要修改任何商品数据。你的任务是只读采集。"
+  - "读完当前页就结束：不要去找分页、不要滚动加载更多、不要尝试进入商品详情页。"
+
+params:
+  limit:
+    type: integer
+    default: 10
+    # ★ 上限压到 40（pdd_search_products 是 200）：首跑只要 5 行就能验收，
+    #   而"多要几行"在真站点上换来的只是更长的停留时间和更多的被挑战机会。
+    ge: 1
+    le: 40
+    description: "最多提取多少条"
+
+output_model: pdd.ProductRowList
+output_model_version: 1
+
+pagination:
+  mode: none
+  # ★ mode: none + max_pages=1 = 明确宣告"本任务不翻页"。
+  #   不写这个字段的话默认值也不会翻，但那就成了"碰巧没翻"；
+  #   写出来之后它是**任务定义的一部分**，can review、能 diff。
+  max_pages: 1
+  next_selector_hint: "本任务不翻页，此字段仅为满足 DSL 结构"
+  stop_when: "读完当前页的表格即结束"
+
+retry:
+  max_attempts: 1
+  # ★ 不重试，而且这是计划 R2 的直接落实：
+  #   "失败不恋战"。首跑失败最可能的原因是风控/登录态，重试只会
+  #   (a) 让同一轮风控挑战再来一次，(b) 烧掉一整轮浏览器启动 + token。
+  #   失败之后的正确动作是看报告里的截图和 steps.jsonl，而不是再跑一遍。
+  step_max_failures: 3
+  on_empty_result: accept
+
+observability:
+  screenshot: true
+  record_llm_io: true
+  # ★ 空列表，**刻意为空**：这份模板是公开仓库的一部分，
+  #   把真实店铺名写进来就等于把店铺名提交到 git 里（runs/ 有 .gitignore，模板没有）。
+  #   想让报告里额外盖掉某个词，改本文件 —— 但改之前先想清楚它会不会被提交上去。
+  redact_extra: []
+
+guardrails:
+  allowed_domains:
+    - "mms.pinduoduo.com"
+    - "*.pinduoduo.com"
+  prohibited_domains:
+    - "*.taobao.com"
+    - "*.jd.com"
+    - "*.alibaba.com"
+
+  # ★ 默认 confirm。本任务没有任何写动作，所以理论上一条规则都不会命中；
+  #   而"理论上不会命中"恰恰是**最需要**保留默认 confirm 的场景 ——
+  #   它挡的正是"我没预料到的那个动作"。LLM 的失败模式就是这个。
+  default_decision: confirm
+
+  approval_timeout_s: 300
+  max_consecutive_blocks: 3
+
+  rules:
+    # ── 一票否决：会改店铺真实数据 ──
+    #   ★ 本任务不点击，所以这条是纯纵深防御。它必须留着：
+    #     护栏的价值恰恰在"LLM 做了我没让它做的事"的时候。
+    - id: block-destructive
+      decision: block
+      reason: "破坏性/不可逆操作，会改店铺真实数据"
+      match_action: [click, input]
+      match_element_text: "删除|批量删除|下架|清空|重置|退出登录|解绑|注销"
+
+    # ── 一票否决：账号与会话 ──
+    - id: block-account
+      decision: block
+      reason: "账号/会话相关，agent 不应触碰"
+      match_action: [navigate, click]
+      match_param_regex: "logout|signout|unbind|password|setting"
+
+    # ── 键盘动作：本任务**一步都不需要**，所以两条都省了 ──
+    #   ★ 这是与 pdd_search_products 的**有意差异**：那份要"按回车搜索"，
+    #     所以必须把"带修饰键的组合 → block、纯功能键 → allow"拆开处理；
+    #     这份连输入框都不碰，键盘动作一条都不该发生。
+    #     于是它落到 default_decision=confirm —— 也就是"agent 万一按了键盘，
+    #     先停下来问我"。这比给它写一条 allow 更符合本任务的定位。
+
+    # ── 人工二次确认：误触写入类控件 ──
+    - id: confirm-edit
+      decision: confirm
+      reason: "写入类操作；本任务只读，确认是否误触"
+      match_action: [click]
+      match_element_text: "编辑|修改|保存|发布商品|保存并上架|提交审核"
+
+    # ── 显式放行：本任务真正要用的那**一个**动作 ──
+    #   ★★ 只放行 extract_table，而且**不能**写 match_element_text ——
+    #      extract_table 不针对任何元素（参数是 table_index/max_rows），
+    #      写了文本判据它对它**永远不可能命中**，它就成了一条"躺在 YAML 里
+    #      从来没生效过"的死条目（2026-09-17 查出的一类静默失效，
+    #      完整经过见 docs/spikes.md 与 runtime/runner.py:unreachable_text_rules）。
+    #
+    #   ⚠️ 刻意**不含** extract / find_text / scroll / go_back：本任务用不到它们，
+    #      而"用不到还放行"就是在为将来的误触提前开一道门。少写一条 = 少一条要审计的。
+    #      （mock 那份模板放行得多，是因为它要验"护栏放行链路通不通"，
+    #        目的不同，规则集就该不同 —— 这也是 DSL 值得存在的原因之一。）
+    - id: allow-extract-only
+      decision: allow
+      reason: "本任务唯一的动作：读表格"
+      match_action: [extract_table]
+      match_url: "*mms.pinduoduo.com*"
+
+agent:
+  use_vision: false
+  # ★ max_actions_per_step=1：一步只做一个动作。首跑要的是**可读的因果链** ——
+  #   steps.jsonl 里"这一步做了什么、下一步为什么变了"要能一眼看出来。
+  #   同批次多个动作会让"第几步出的问题"变得需要推测。
+  max_actions_per_step: 1
+  # ★ 步数上限压到 12（pdd_search_products 是 60）：本任务的正确解最多 2-3 步
+  #   （读表 → done）。给到 60 步只会让它在"读不到"的时候自己发明办法 ——
+  #   而在真站点上，"自己发明办法"就是风险本身。
+  max_steps: 12
+  max_failures: 3
