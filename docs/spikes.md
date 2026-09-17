@@ -800,6 +800,57 @@ e2e，其中包括护栏那条 `/goods/delete/` 的 HTTP 层断言 —— 那是
 但只要 browser job 开始无声腐烂（例如库升级破掉一条未文档化契约），
 CI 会一直绿，而那句 README **会在没人知道的情况下变成假的**。
 
+#### 已落地（2026-09-17，Phase 4）+ 两条对照实验的实测结果
+
+形状与上面那条计划一致，只有一处**改良**（见下）。落点：
+
+| 位置 | 改了什么 |
+|---|---|
+| `devtools/probe_browser.py` | 加 `--verdict-json <path>`，落一份机器可读结论。**`exit 0` 契约未动。** |
+| `devtools/ci_gate.py` | **新增**：判决逻辑（纯函数 `gate()` + `main()`） |
+| `tests/test_ci_gate.py` | **新增**：真值表 + 两条对照实验（13 条，毫秒级） |
+| `.github/workflows/ci.yml` | job 级 `continue-on-error` 删除；降到 `apt`/`probe`/`browser_tests` 三步；末尾加 gate 步骤（**它自己没有 continue-on-error**，于是 job 的颜色由它决定） |
+
+**改良的那一处**：计划里 gate 是"后面加一步"（暗示写在 YAML 的 shell 里）。
+实际抽成了 `devtools/ci_gate.py`。理由是它是**一条有真假的判断**，不是一次 IO：
+
+- 写在 YAML 里就只能靠"往 main 推一次坏提交看颜色"来验 —— **不可复现**；
+- 更要命的是**验不了反面**：没法在 CI 上故意让环境坏掉，
+  于是"环境不可用 → 只 warning"这一半永远没被验过 ——
+  而那一半恰恰是**唯一能把红洗成绿**的路径，是全项目最需要被测的一段逻辑。
+- 抽出来之后，真值表在 `tests/test_ci_gate.py` 里本地毫秒级可验，
+  而且进了**离线门禁**（那个 job 是硬门禁），所以它以后不会被无声改坏。
+
+**两条对照实验的实测**（`--tests-outcome` 用同一条**真的坏掉**的
+`needs_browser` 用例喂进去，探针结论用真跑出来的那份）：
+
+| 实验 | 输入 | 实测结果 |
+|---|---|---|
+| 一：故意破坏一条 `needs_browser`，确认 gate 真红 | 坏用例（退出码 1）+ 真实探针结论（`usable=true`） | `::error::` + **退出码 1（真红）** |
+| 二：人为让探针报环境坏，确认只是 warning | 同一条坏用例 + 手写的 `usable=false` 结论 | `::warning::` + **退出码 0（绿）** |
+| （补）结论文件缺失 | 不存在的路径 | `::error::` + **退出码 1** |
+
+★ 补做第三条是因为它是这套机制里**最危险的默认值**：
+探针崩了 / 没写结论 / 字段没了，都必须按"环境可用"处理（→ 真红）。
+反过来（默认不可用）会让探针的**任何**故障把真实测试失败洗成绿 ——
+**一个能自动把红洗成绿的机制，比没有这个机制危险得多。**
+同 `default_decision=confirm`：拿不准时选更严的那边。
+
+#### 判据刻意写窄，以及为什么"探针能起、库的路径起不来"判成**可用**
+
+判"环境不可用"的唯一条件是：**两条启动路径都起不来**，或者压根找不到 Chrome。
+
+不把"探针能起、库自己的路径起不来"也判成不可用 —— 明明那时测试也跑不起来：
+
+> 那正是 Phase 3 那次 CI 全红的形态（库挑中 `/usr/bin/chromium`，
+> 探针挑 `/usr/bin/google-chrome`，**两者不是同一个二进制**）。
+> 它看起来像环境问题，实际是**我们自己的配置不一致** —— 是我们的问题，
+> 也该由我们看见。把它归进"环境坏了"，等于把这一类**唯一能靠改配置修掉**的
+> 故障藏起来。
+
+★ 这条判据每放宽一格，就多一类真失败可能被洗成绿。
+**"红能被解释掉"本身没有价值，除非那个解释是可证的。**
+
 ---
 
 # Phase 3 live 验收：一次真 token 运行带回的两条库事实（2026-09-17）
@@ -950,3 +1001,215 @@ YAML 里明写 `agent: use_vision: false`，编译产物也确认带上了
 （`library_calls=0`）。`total_calls` 是可信的（那是我们自己的计数器），
 所以 LLM **次数**的账是准的、**用量**的账是空的。
 Phase 4 若不涉及成本统计可以不动，但**不要**把 0 当成"没花钱"读。
+
+---
+
+# Phase 4 探路结论：真实浏览器 e2e 抓出来的四条（2026-09-17）
+
+`tests/test_mock_pdd_e2e.py` 是 Phase 4 的 e2e 载体（真 Chrome + 本地 mock 站点）。
+它一次跑通之后带回来四条**只有跑真路径才能拿到**的事实。四条都是同一个形状：
+
+> **单测全绿，生产路径一跑就崩。** 而根因都不是"某处写错了"，
+> 是"我们依赖的那个约定的**颜色/类型**和我们的假设相反"。
+
+这也是这一节的共同教训：**这类错误无法靠"再多写几条单测"发现**，
+因为坏掉的恰恰是"单测和真路径之间的那层差异"。
+
+## 事实 1：`verify_extract_table_round_trip` 在它唯一的调用点上**一次都跑不成**
+
+`extract_table.py` 的启动自检内部用 `asyncio.run(...)` 调一次动作函数，
+而它唯一的调用点是 `runner.py` 的 `TaskRunner.run()` —— 一个**协程**。
+
+```
+RuntimeError: extract_table 的接线不通：
+  RuntimeError: asyncio.run() cannot be called from a running event loop。
+<sys>:0: RuntimeWarning: coroutine '...extract_table' was never awaited
+```
+
+★ 为什么这个特别值得记：
+
+- **所有离线单测都是同步调它**，于是 13 条全绿；生产路径是异步的，一跑就崩。
+- `tests/test_extract_table.py` 里恰好有"自检必须当场抛"的对照实验 ——
+  它证明了这个自检**写得对**，但它证明不了"这个自检**跑得起来**"。
+  两件事完全独立，而只有后者在生产上重要。
+- 失败形态极隐蔽：`asyncio.run()` 抛错时那个协程**从未被 await**，
+  Python 只打一条 `RuntimeWarning: coroutine was never awaited` ——
+  一条默认不致命、容易淹在几十条 warning 里的提示。
+
+**修法**：`verify_extract_table_round_trip` 改 `async def`，调用点 `await`；
+`tests/test_extract_table.py` 的那两条用例跟着改 `async def`。
+
+★ 顺带得到一个哨兵：用例的颜色（sync/async）**和被测路径不一致，本身就是测不到**。
+改 async 之后，谁再把门禁改回同步实现，这两条会立刻红。
+
+## 事实 2：`page.evaluate` 返回的是 **JSON 字符串**，不是对象
+
+`extract_table_impl` 里写的是：
+
+```python
+payload: dict[str, Any] = await page.evaluate(_TABLE_JS, {...})
+if not payload.get("found"):     # ← 'str' object has no attribute 'get'
+```
+
+`browser_session.get_current_page()` 返回的是 **`browser_use.actor.page.Page`**，
+**不是 playwright 的 Page**（它连 `.url` 属性都没有 —— 一个同名异类的直觉陷阱）。
+它的签名是 `evaluate(page_function: str, *args) -> str`，docstring 原文：
+
+> *String representation of the JavaScript execution result.
+> Objects and arrays are JSON-stringified.*
+
+**它永远返回字符串**：对象走 `json.dumps`、`None` 变空串 `''`、数字/布尔走 `str()`。
+
+★ 实测拿到的东西（JS 执行得**完美**，一个字都没错）：
+
+```python
+type: <class 'str'>
+repr: '{"found": true, "tableCount": 1, "headers": ["商品ID", "商品标题", ...], ...}'
+```
+
+★★ **这条 bug 是被一个写错了的桩放进来的**，而这一点比 bug 本身重要：
+
+`tests/test_extract_table.py` 的 `_FakePage.evaluate` 原来 `return self.payload` ——
+**直接回一个 dict**。于是桩喂 dict、实现要 dict，两边一拍即合，13 条全绿。
+
+> 教训不是"这个桩写错了"，而是：**桩的形状比真实对象宽松时，
+> 它就不再是桩，而是一块遮羞布。**
+
+桩必须模仿真实契约里**最容易搞错的那一面**（包括"返回值类型反直觉"）。
+所以现在的 `_FakePage` 显式 `json.dumps`，并且留了一个 `raw` 口子供
+"返回值不是合法 JSON"的对照实验；另加一条用例断言**桩本身回的是字符串**
+（防止有人把它改回 dict，让这个 bug 重新变得不可见）。
+
+**修法**：新增 `_decode_table_payload(raw) -> dict | None`，
+三种坏形态（空串 / 非 JSON 裸串 / 非 dict）都返回 None → 转成一条给 LLM 看得懂的 error。
+另加一条**反向对照**（`test_a_dict_payload_is_now_rejected_...`）：
+把旧桩的行为喂进来必须失败 —— 它让"解析这一步是承重的"变成可证伪的。
+
+## 事实 3：`browser_use.actor.Page.evaluate` 的返回值契约不进 tool schema
+
+见上。补一条：**这个类没有 `.url`**（`browser_state.url` 才有）。
+第一版探针里 `print(page.url)` 直接 AttributeError —— 排查时很容易
+误以为是"页面没导航过去"，而真相是"拿错了类的属性"。
+
+## 事实 4：护栏的 `guard_notice` **替换**了被拦的动作，所以 steps.jsonl 里查不到那个动作
+
+e2e 判据 3 原来断言 `_click_step(steps)["actions"][0]["element_text"] == "批量删除"`，
+实际记录是：
+
+```json
+{"name": "guard_notice",
+ "params": {"message": "HUMAN_DENIED: 动作 click「批量删除」被拒绝 …"},
+ "element_text": null}
+```
+
+这是**设计如此**（替换而不是删除，理由见 README 的 ADR 4 / interceptor.py），
+但带来一处**可观测性的已知边界**，诚实记下来：
+
+> `guardrail_decisions` 里只有 `rule_id / decision / reason / match_element_ids / approved / approved_by / decided_at`，
+> **没有**"被拦的动作名和元素文本"。
+> 要回答"到底拦了什么"必须去读那条 `guard_notice` 的 message 文本。
+> 要补的话是给 decision 记录加字段（`action_name` / `element_text`）——
+> Phase 4 不做，但**不要**以为 `steps.jsonl` 里有那个 `click`。
+
+★ 顺带一条**意外收获**：真实运行里那一步的
+`matched_rule_ids == ["allow-readonly", "block-destructive"]` ——
+同一动作同时命中 allow 和 block，最终判定是 block。
+这是**「最严优先」在真实数据上的证据**（真值表在 `test_guardrail_policy.py`），
+已固化成 e2e 的一条断言。
+
+## 事实 5：三份任务模板里躺着 5 条**永远不会命中**的护栏条目（已加启动自检）
+
+这条是清 `extract_table` 死条目时**顺手查出来的**，范围比原以为的大得多。
+成因是两个**各自都正确**的决定相乘：
+
+1. 四个匹配维度是 AND，而 `match_element_text` 在拿不到元素文本时判【不命中】
+   （`guardrails/rules.py:117-124` —— 刻意的：把 `None` 当空串会让写错的规则拦死一切）；
+2. 元素文本的唯一来源是**参数里的 `index`**
+   （`guardrails/interceptor.py:_text_for` 只读这一个键）。
+
+→ **任何"不针对元素"的动作在带 `match_element_text` 的规则里永远不可能命中。**
+
+实测（新增的启动自检 `runtime/runner.py:unreachable_text_rules`）：
+
+```
+tasks/pdd_search_products.yaml : 3 -> [('block-destructive', 'send_keys'),
+                                      ('allow-readonly', 'extract'),
+                                      ('allow-readonly', 'go_back')]
+tasks/books_demo.yaml          : 2 -> [('allow-readonly', 'extract'),
+                                      ('allow-readonly', 'go_back')]
+tasks/mock_shop_readonly.yaml  : 0 -> []
+```
+
+**两个方向，严重性完全不同，不要混为一谈：**
+
+| 形态 | 例子 | 实际后果 | 方向 |
+|---|---|---|---|
+| 以为放行了，其实是 `confirm` | `allow-readonly` 里的 `extract` | 每个只读抽取都要人点一次批准 | fail-closed，但**难用 + YAML 在说谎** |
+| **以为拦死了，其实只是 `confirm`** | `block-destructive` 里的 `send_keys` | 想挡的那类键盘操作（按 Enter 确认删除…）退化成"请人确认" | ⚠️ **fail-open** |
+
+第二行是这次真正的收获 —— 它和本项目其他几条"看起来在防、实际没防"是同一类，
+但**这次的 `YAML` 读起来毫无破绽**：动作名是真的、正则是对的、缩进是对的。
+
+**判据刻意不写成"危险动作名单"**：那种名单会随库版本静默失配，
+而这个检查恰恰是用来防静默失配的 —— 它自己不能变成新的静默点。
+所以它反射 `RegisteredAction.param_model` 里有没有 `index` 字段，
+并由 `tests/test_compat.py` 的哨兵盯着那个未文档化的属性名。
+
+★ **这个检查自己也有一个"读不到就不表态"的分支**（拿不到注册表 → 返回空）。
+不能省：返回空集会让"没有任何动作带 index"成立，于是**每条带文本的规则都报警**，
+而假警报会训练人忽略这个检查 —— 防静默失效的东西自己静默失效。
+
+**处置（2026-09-17，经用户拍板，已完成）**。修法**不是删掉几个词**，
+而是按"判据能不能用"把放行拆成两条：
+
+| 规则 | 判据 | 管什么 |
+|---|---|---|
+| `allow-readonly-text` | 动作名 + URL + **元素文本** | 点击/输入类 |
+| `allow-readonly-noelement` | 动作名 + URL（**无文本判据**） | `extract` `extract_table` `go_back` `scroll` `find_elements` `find_text` |
+
+键盘动作同理拆了 `block-destructive-keys` / `allow-readonly-keys` 两条，
+靠**参数**而不是元素文本区分。**刻意不放行** `evaluate`（任意 JS）与
+`navigate`（归 Layer 0 白名单）。
+
+★ 修完之后三份模板的 `unreachable_text_rules` 都是 `[]`，并且这条**由断言盯着**
+（`test_runner_offline.py::test_all_real_task_yamls_now_have_zero_unreachable_rule_entries`）——
+因为拆错了的症状和修复前**一模一样：完全静默**。
+
+★★ 这一轮改测试时出现了一个**重复出现的形状**，值得单独记：
+两条"证据型"测试（`test_mock_pdd.py` 里那条、`test_runner_offline.py` 里那条）
+原本都是**绑在真实缺陷上**的 —— 它们断言的是"pdd 模板里 extract_table 不是 allow"、
+"真实 books 模板里有死条目"。缺陷一修好，它们就红了。
+**直接删掉它们会连同"检测能力"一起删掉**，于是都改成用**合成规则**提供对照：
+覆盖一样，代价为零，而且不再要求仓库里长期留一个缺陷来养测试。
+
+> 这个形状的一般式：**"断言缺陷存在"的测试，会在缺陷修好时变成负债。**
+> 修法不是删断言，而是把断言从"某个真实对象当前坏着"改成
+> "给这个坏形状，检测器必须报出来" —— 前者测世界，后者测机制。
+> 而测机制的那条才能活过修复。
+
+> ★ 这条最值得记的形状：**"更安全的默认值"会制造出"写了但从不生效"的规则。**
+> 安全默认值和静默失效常常是同一个决定的两面。
+> 而代价不是"它拦少了"，是**它让 YAML 在说谎** —— 读策略的人会以为自己看到的是实际策略。
+
+## 附：Phase 4 的护栏 e2e 验收怎么做到"可证伪"
+
+验收句是"`/goods/delete/` 的调用标志为 False"。**一条永远为真的否定断言没有信息量**，
+所以这个文件里的全部重点是让"那一击**本来会**写成"这件事可证：
+
+| 用例 | 干什么 | 证明什么 |
+|---|---|---|
+| A（正对照） | **绕过拦截器**，裸 Agent 真点「批量删除」 | mock 真的会收 POST；`write_calls()` 的标志**确实会翻** |
+| B（验收） | 走完整 `run_task`，FakeLLM **主动瞄准**「批量删除」 | `write_calls() == []`，且判定记录指向 `block-destructive` |
+
+两个细节让"瞄准"不是空话：
+
+1. **索引从活 DOM 里现找**，不写死（`_click_target_index` 解析提示词文本，
+   用例 A/B 共用同一个函数 —— 两边不一致就说明"记录下的"和"发出去的"不是同一份）。
+2. **A 额外从活页面读 `data-mock-version`**（`page.evaluate`）并与 `MOCK_VERSION` 比对 ——
+   独立证明这一轮跑的是 mock，不是某个真站点。
+
+★ 一处**刻意不做的断言**，值得说明：用例 B 不去断言 `data-mock-version`。
+因为可观测性只落 URL / 标题 / 元素文本 / 截图，**不落 DOM 文本** ——
+那个属性在 B 的产物里根本不存在。它该断言的地方是
+`tests/test_mock_pdd.py::test_every_page_carries_the_mock_marker`（离线）和用例 A（活 DOM）。
+把"断言不到但听起来更强"的那条塞进去，只会让人以为覆盖了。

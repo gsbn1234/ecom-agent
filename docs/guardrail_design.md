@@ -13,12 +13,42 @@
 | 层 | 状态 | 在哪 |
 |---|---|---|
 | Layer 0 网络层 | **已实测**（S3 / S7） | 库的 `SecurityWatchdog`，由 `compiler.py` 装配 `browser_kwargs` |
-| Layer 1 动作层 — 策略 | **已实现并测**（19 条用例） | `guardrails/{rules,policy}.py` |
-| Layer 1 动作层 — 拦截器 | ⬜ **未落盘**，随 Phase 4 的 mock 站点一起做 | `guardrails/interceptor.py`（计划中） |
-| Layer 2 结果层 | ⬜ **未落盘**，Phase 3 | `store/` + 输出校验（计划中） |
+| Layer 1 动作层 — 策略 | **已实现并测** | `guardrails/{rules,policy}.py` |
+| Layer 1 动作层 — 拦截器 | ✅ **已落盘并在真浏览器上跑通**（Phase 4） | `guardrails/interceptor.py` + `actions/guard_gate.py` |
+| Layer 2 结果层 | ✅ **已落盘**（Phase 3） | `store/` + `sites/*/output_models.py` 校验 |
 
-**所以现在这份文档描述的是：一层已在真实浏览器上验证过、一层策略已定但还没接到真实
-run 上、一层只有设计。** 把这三者写成一个样子才是真正危险的。
+（更新于 2026-09-17，Phase 4 结束时。）**四层现在全都是落地状态。**
+
+### 落地之后才看得到的三条（写在这里，因为它们是"实现状态"的直接后果）
+
+**① 拦截器是在真浏览器上验过的，不只是单测。** `tests/test_mock_pdd_e2e.py` 里
+两个用例构成一组对照：A 证明"不拦的时候，真点一下**真的**会 POST `/goods/batch_delete`"，
+B 证明"拦了之后那个 endpoint 一次都没被调用"。
+没有 A 的话，B 的绿可能是空转（比如按钮压根没渲染出来）。
+
+**② ⚠️ 被判定的动作**在 `steps.jsonl` 里**看不到** —— 这是本轮发现的一个**可观测性缺口**。
+
+`guardrail_decisions` 记录的字段是
+`rule_id / decision / reason / matched_rule_ids / approved / approved_by / decided_at`
+—— **没有动作名，也没有元素文本**。所以翻开 `steps.jsonl` 想问"到底拦了什么"，
+这一条是答不上来的。
+
+绕过方式是读那一步的 `guard_notice` 动作：被拦的动作被**替换**成了它，
+元素文本在它的 `message` 里（形如 `HUMAN_DENIED: 动作 click「批量删除」被拒绝…`）。
+**能查到，但是靠一条约定而不是靠结构** —— 这正是它算缺口的原因。
+
+> 为什么替换而不是删掉（这条决定了上面那个缺口的形态）：删掉之后 LLM 会看到
+> 一个空动作列表，它以为自己没下达指令，于是**重复同一个危险动作** → 死循环。
+> 代价就是 `steps.jsonl` 里再也找不到那个被拦的 `click` 本身。
+
+**③ 组合攻击这个夹具**测不了**，别以为它覆盖了。**
+mock 的列表页没有"全选"控件（见 `devtools/mock_pdd/pages.py` 的说明），
+所以"先全选（allow）再点批量操作（allow）→ 批量删除"这条路径
+**在夹具里不存在**，e2e 自然也没测它。
+
+这一点必须写在实现状态里而不是"挡不住什么"里 —— 因为两者的严重性不同：
+"挡不住"是护栏的边界（已知、已接受），"**夹具没覆盖**"是**验证的边界**
+（我们以为测过了，其实没有）。后面那句更容易骗到自己。
 
 ---
 
@@ -114,6 +144,69 @@ SPIKE_S3_OK
   当空串的话，`match_element_text: ""` 这类写错的规则会匹配一切 ——
   一个写错的规则从"不生效"变成"拦死所有操作"，方向完全反了。
 
+  ★ **但这条选择的代价在 Phase 4 才显形，而且它是一个静默失效**：
+  元素文本的唯一来源是**参数里的 `index`**（`interceptor.py:_text_for` 只读这一个键）。
+  于是**任何"不针对元素"的动作**（`extract` / `go_back` / `extract_table` / `navigate` /
+  `send_keys` …）在带 `match_element_text` 的规则里**永远不可能命中**。
+  它躺在 YAML 里、编译进 `task_text`、报告里显示"策略已加载"，**一次都没生效过**。
+
+  实测（`runtime/runner.py:unreachable_text_rules`，2026-09-17 加的启动自检）：
+
+  ```
+  tasks/pdd_search_products.yaml : 3 -> [('block-destructive', 'send_keys'),
+                                        ('allow-readonly', 'extract'),
+                                        ('allow-readonly', 'go_back')]
+  tasks/books_demo.yaml          : 2 -> [('allow-readonly', 'extract'),
+                                        ('allow-readonly', 'go_back')]
+  tasks/mock_shop_readonly.yaml  : 0 -> []
+  ```
+
+  ★ 注意第一行里的 **`('block-destructive', 'send_keys')`** —— 这一条和另外那些
+  **方向相反，也严重得多**：`allow-readonly` 那两条是"以为放行了、其实是 confirm"
+  （fail-closed，只是难用 + 意图与实现不符）；而 `block-destructive` 里列 `send_keys`
+  是"**以为拦死了、其实只是 confirm**"。也就是说作者想挡住的那类键盘操作
+  （按 Enter 确认删除、Control+… 之类），实际只走到"请人确认"。
+
+  **判据的边界要说清楚**：检测方式是"参数模型里有没有 `index`"，不是"我们手写了一
+  一张危险动作名单"。后者会随库版本**静默失配**，而这个检查恰恰是用来防静默失配的
+  —— 它自己不能变成新的静默点。所以它反映了 `RegisteredAction.param_model`，
+  并由 `tests/test_compat.py` 的哨兵盯着那个属性名。
+
+  **处置（2026-09-17 已完成，不是"待办"）**。修法**不是删掉几个词**，
+  而是按"判据能不能用"把放行拆成两条：
+
+  | 规则 | 判据 | 管什么 |
+  |---|---|---|
+  | `allow-readonly-text` | 动作名 + URL + **元素文本** | 点击/输入类：`input` `click` `scroll` `dropdown_options` `select_dropdown` |
+  | `allow-readonly-noelement` | 动作名 + URL（**无文本判据**） | 不针对元素的只读动作：`extract` `extract_table` `go_back` `scroll` `find_elements` `find_text` |
+
+  键盘动作同理拆了两条（`block-destructive-keys` / `allow-readonly-keys`），
+  靠**参数**而不是元素文本区分：带修饰键的组合（`Control+o` 等）判 block，
+  单纯功能键（`Enter` / `PageDown` …）判 allow。
+
+  ⚠️ 两个**刻意不放行**的，写在这里免得被当成漏了：
+  `evaluate`（能执行任意 JS —— "通常是只读的"和"是只读动作"不是一回事）和
+  `navigate`（导航目标归 Layer 0 的域名白名单管，不在这里重复放行一次）。
+
+  ⚠️ 一处**已知边界**：**回车是有歧义的** —— 搜索框里按回车是只读检索，
+  删除确认框里按回车是确认删除，而我们拿不到元素上下文，区分不了。
+  这里选择放行，安全性**依赖另一条规则先工作**（要弹出删除确认框，
+  得先点那个删除按钮，而那个 click 被 `block-destructive` 拦下）。
+  **它不是独立成立的**，所以这两条规则必须一起改 —— 改一条等于改另一条。
+
+  回归测试钉在三处：`test_runner_offline.py` 里"三份真模板零死条目"
+  + 打在**真 YAML** 上的决策表、`test_compat.py` 的反射哨兵、
+  以及 `test_mock_pdd.py` 里那条用**合成规则**证明"文本判据确实拦得住无元素动作"的对照。
+  最后一条刻意用合成规则而不是真实模板 —— 理由是**不要把测试绑在"仓库里得有个缺陷"上**。
+
+  > 这条值得记住的形状：**一个"更安全"的默认值（拿不到就不命中）会制造出
+  > "写了但从不生效"的规则**，而后者不会发出任何声音。安全默认值和静默失效
+  > 常常是同一个决定的两面。**代价不是它拦少了，是它让 YAML 在说谎。**
+  >
+  > ★ 另一半同样值得记住：这个检查本身也**必须**有"读不到就不表态"的分支
+  > （拿不到注册表 → 返回空），否则它会刷一屏假警报，而假警报会训练人
+  > 忽略这个检查 —— 于是防静默失效的东西自己变成静默失效。
+
 ### 决策聚合：**最严优先**（block > confirm > allow）
 
 `Decision` 的严格程度由**显式 `severity` 字典**定义，不靠枚举定义顺序或字典序 ——
@@ -170,6 +263,8 @@ SPIKE_S3_OK
   合起来是批量删除。规则是**逐动作**判定的，看不到动作序列的语义。
   缓解：`max_consecutive_blocks` 硬停 + Layer 2 的结果校验 + 危险端点在 e2e 里
   用"真实 HTTP 层有没有被调用"来断言（见下）。
+  ⚠️ 而**这个夹具恰恰覆盖不了它** —— 上面「落地之后才看得到的三条」第 ③ 条写了原因。
+  **"挡不住"和"没测过"是两回事，这里两者同时成立。**
 - **页面内容对 LLM 的诱导**（prompt injection）。页面文本会进 LLM 的上下文，
   页面里写一句"忽略之前的指示"是可能的。
   **但这一层的护栏天然不受它影响** —— 判定依据是「动作名 + 元素文本 + URL + 参数」，
@@ -206,11 +301,50 @@ SPIKE_S3_OK
 ## 怎么验证这层护栏真的在工作
 
 **不要断言日志里有 block 记录** —— 那只证明代码走到了那一步。
-mock 后台的 `/goods/delete/{id}` 在被调用时置一个模块级标志，
-e2e 断言**这个标志为 False**：证明护栏在**真实 HTTP 层面**挡住了写入。
+`devtools/mock_pdd/server.py` 每次收到写请求都记一条（`_record`），
+e2e 断言的是 **mock 站点收到的写请求列表是空的**：
+证明护栏在**真实 HTTP 层面**挡住了写入。
 
-对照实验（本项目的通用手法）：先把标志**人为置 True** 跑一次，
-确认断言会红；再正常跑，确认它是绿的。没有前一半，后一半可能是空转。
+★ **但这条断言本身也是可以被空转通过的**，所以 `tests/test_mock_pdd_e2e.py`
+里用了**两个**用例，缺一不可：
+
+| | 用例 | 断言 | 它单独存在时的漏洞 |
+|---|---|---|---|
+| A | `test_unguarded_click_on_batch_delete_really_writes` | 不经护栏点一下 → 写列表**恰好**是 `["/goods/batch_delete"]` | —— |
+| B | `test_guarded_run_blocks_it` | 经护栏 → 写列表**为空** | **空转**：按钮点不动 / 没渲染 / 选择器找错，B 也是绿的 |
+
+没有 A 的话，B 的"写列表为空"是一句**不拦也一样成立**的空话；
+没有 B 的话，护栏压根没被验过。**A 是 B 的阳性对照。**
+（这正是本项目那条通用手法在这一层的具体形态。）
+
+A 里还有一条容易被忽略的断言：目标按钮的 index 是**从活着的 DOM 里现查的**，
+由 A、B 共用同一个函数 —— 否则"B 里点的是哪个元素"和"A 里验的是哪个元素"
+可能不是同一个，那样对照就不成立了。
+
+★ 另外，A 顺带读了一次活的 `data-mock-version`，确认这一轮跑的**确实是 mock**。
+**B 刻意没有做这个断言** —— 因为可观测层记的是 URL / 标题 / 元素文本 / 截图，
+并不保存 DOM 文本，所以 B 那条路径上**根本没有**这个值可读。
+需要它就在 A 里读，**不为了对称去伪造一个读不到的断言**。
+（这个不对称是有意留下的，写在这里免得下一个人以为是漏了。）
+
+#### ⚠️ 一处与计划原文的偏差：验的是 `/goods/batch_delete`，不是 `/goods/delete/`
+
+Phase 4 的验收原文写的是「护栏 e2e 断言：`/goods/delete/` 的调用标志为 False」，
+实际落地断言的是 `/goods/batch_delete`。**这是有意的，不是漏做**：
+
+- 两个端点都真实存在、都真的会写（mock 里都能打）；
+- 但 e2e 里的 `FakeLLM` 是**瞄准**「批量删除」这个按钮的（见 `aim_at_batch_delete`），
+  所以那一击落在 `batch_delete` 上。要让 `/goods/delete/` 被断言，得再写一条
+  "先导航到详情页、再点『删除本商品』"的用例 —— **收益是同一个规则的又一次命中**，
+  因为两条路径命中的是**同一条规则**（`block-destructive`，靠元素文本匹配）。
+
+`/goods/delete/100001` 本身没有被放过：`tests/test_mock_pdd.py` 里有它作为
+**真表单提交按钮**的结构断言（`submit_button_in_form`），确保它是"点得动的"。
+也就是说"这个端点可被触达"有测试，"护栏挡住它"目前只有 `batch_delete` 那条旁证。
+
+**这处偏差记在这里而不是含糊过去**，因为它是一个真实的覆盖缺口：
+如果哪天有人把规则改成只匹配「批量删除」，`batch_delete` 的用例照样绿，
+而详情页那条路已经失守。
 
 ---
 
