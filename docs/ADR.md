@@ -148,3 +148,159 @@ browser-use，而且是一个人写。
 **证据在哪**：`devtools/spike_s1_callback_rewrite.py` + `docs/spikes.md` 的 S1 一节
 （当时的具体输出，不是"应该可以"）；`ecom_agent/guardrails/interceptor.py`；
 `tests/test_compat.py`（签名哨兵）。
+
+---
+
+## ADR 6 · 为什么规则聚合用「最严优先」而不是「先匹配先赢」
+
+**决定**：多条规则同时命中时，取最严的那条（`block` > `confirm` > `allow`），
+**与 YAML 里的书写顺序无关**。同severity 并列时用 `rule_id` 排序做 tiebreaker —— 也是顺序无关的。
+
+**为什么**：YAML 是**有顺序**的。如果按"先匹配先赢"，那么"把一条 `allow` 写在 `block` 前面"
+就是一个**静默的安全漏洞**：规则集看上去没问题，review 的人也不会觉得哪里不对，
+但那条 block 永远不会生效。最严优先让规则集变成**集合语义** —— 评审时只需看集合本身，
+不需要在脑子里模拟匹配顺序。
+
+**代价与被否掉的选项**：
+- **不能**用"把例外规则写在前面"来表达例外。要表达例外，必须改规则条件本身
+  （比如把 `match_url` 写得更具体），这更难写 —— 但有代价的难写好过静默失效。
+- 被否掉的"先匹配先赢"不是没有好处：它更容易表达"一般规则 + 特例覆盖"这种直觉。
+  否掉它的理由只有一个，但足够：**它的失效模式是静默的，而且失效的恰好是安全的那一侧**。
+
+**证据在哪**：`tests/test_guardrail_policy.py` 三条 ——
+`test_most_severe_wins_when_multiple_rules_match`、
+`test_rule_order_does_not_affect_decision`（**两个顺序相反的规则集，断言决策完全一致**）、
+`test_ties_broken_by_rule_id_not_yaml_order`。
+
+---
+
+## ADR 7 · 为什么 `default_decision` 默认是 `confirm` 而不是 `allow`
+
+**决定**：没有命中任何规则时 → **人工确认**（fail-closed），不是放行。
+
+**为什么**：LLM 的失败模式恰恰是**做了你没预料到的那个动作**。默认放行等于承认
+"护栏只在写了规则的地方生效"—— 而危险恰恰来自没写规则的地方（规则是人写的，
+人想不到的正是漏掉的那些）。默认 confirm 把"没想到"从**静默放行**变成
+**一次必须有人回答的提问**。
+
+**代价**：
+- **误报会明显变多**：每个没预料到的动作都要人点一下。这是真实的、每天都会感觉到的成本。
+- 所以必须配够用的审批通道，否则这个默认值会把人逼回去改成 allow：
+  `WebApprover`（默认）/ `CliApprover`（本机调试，用 `asyncio.to_thread` 避免阻塞事件循环
+  掐断 CDP 心跳）/ `FileApprover`（无头）/ `AutoDenyApprover`（测试专用，永远拒）。
+- **超时一律按拒绝**（fail-closed），`CliApprover` 默认选项是 `N`，回车即拒绝。
+- 另一条代价说直白些：默认 confirm 意味着**这个系统需要有人在场**。它不是无人值守的
+  批量工具 —— 那是另一个产品，不是这个。
+
+**证据在哪**：`tests/test_guardrail_policy.py::test_default_decision_is_confirm_not_allow`；
+`tests/test_approver.py::test_timeout_is_denied_not_approved` 与
+`test_channel_exception_is_denied_not_approved`（连"审批通道自己抛异常"都判拒绝，
+不是放行）—— 这两条钉的是"fail-closed 不是口号"。
+
+---
+
+## ADR 8 · 为什么用持久 profile，而不是 `sensitive_data` 占位符替换
+
+**决定**：人工跑一次 `devtools/login_pdd.py` 扫码登录 → 之后复用那个 profile 目录，
+**agent 永远不碰登录表单**。`sensitive_data` 机制仍按**按域形态**搭好（面试会问到），
+但**绝不用扁平形态**。
+
+**为什么持久 profile 更硬**：密码**根本不进入 Agent** ——
+不出现在提示词里、不出现在截图里、**也不需要脱敏代码来兜底**。
+占位符替换的失败模式是"替换没生效"或"替换错了字段"，而这两者都是**静默**的：
+run 照常跑完，只是一个密码被填进了不该填的地方。
+
+**代价与三个实测坑**（这条 ADR 里最值钱的其实是坑，不是结论）：
+1. ★★★ 库的 `BrowserProfile._copy_profile()` 会把 `user_data_dir` **偷偷拷到 `%TEMP%`
+   再把字段换成那个目录**（因为我们的 `executable_path` 永远指向 chrome.exe →
+   `is_chrome` 恒真 → 必走此路）。后果：**扫码看着成功 → 之后每次 run 都在登录页 →
+   退出码 0、报告齐全、sqlite 零行**。修法是构造后把目录钉回去（`pin_user_data_dir`）。
+2. `BrowserSession(browser_profile=obj)` **不使用** `obj` —— 必须构造完再钉在
+   `session.browser_profile` 上。这条和上一条合起来，构成"看着配了、其实没配"的典型。
+3. **cookie 落盘取决于怎么关**：`session.stop()` 实测丢 cookie，必须走 CDP `Browser.close`
+   （`close_gracefully_and_flush`）。
+- ⚠️ **扁平形态是红线，理由是源码事实**：扁平形态**无条件**放行到所有域，
+  于是一份拼多多密码在访问任何站点时都可能被填入。
+
+**证据在哪**：`ecom_agent/runtime/browser.py` 的三个包装；
+`tests/test_profile_persistence.py`（含**对照**：不钉 → cookie 落到库的临时目录 → 登录态丢）；
+`docs/spikes.md` 的「Phase 6 探路结论」；
+`tests/test_compat.py::test_sensitive_data_is_not_a_reserved_param_name`。
+
+---
+
+## ADR 9 · 为什么截图必须自己另存；为什么用 `get_structured_output(Model)`
+
+**决定**：截图自己另存到 `runs/{run_id}/screenshots/` 并记 `sha256`；
+结构化输出只走 `history.get_structured_output(Model)`，不用 `.structured_output`。
+
+**为什么截图要另存**：库自己落的截图在**系统临时目录**（`agent_directory`）——
+**关机即失**。审计证据不能放在会被系统清掉的地方。顺带收获一个便宜且好用的诊断信号：
+连续两步的 `sha256` 相同 = "页面没变化（可能点击无效）"。
+
+**为什么必须用 getter**：`history.structured_output` 这个 property 依赖私有字段
+`_output_model_schema`，而它**序列化后就丢失** → 存过盘再读回**永远返回 `None`，
+且不报错**。这是"数据没了但没有任何信号"的典型，也正是本项目最怕的那一类。
+
+**代价**：自己另存要处理"裸 base64 vs data URI 前缀"。库给的是**裸 base64**
+（`data:image/png;base64,` 前缀只在发给 LLM 时才加），所以代码里显式判断并剥前缀 ——
+成本一行，收益是"哪天库改了，不会静默写出一个损坏的 PNG 直到打开报告才发现"。
+
+**证据在哪**：`tests/test_browser_contract.py`（S5/S6 的守卫）；
+`docs/spikes.md` 的 S5、S6 两节（含当时的实际输出）；
+`tests/test_compat.py::test_history_accessors_we_depend_on`。
+
+---
+
+## ADR 10 · 为什么不做 LLM 修复解析失败的结果
+
+**决定**：四档容错 —— ① LLM 侧自动重试（`done` 的参数是 pydantic 模型，不合 schema 时
+库自己的校验就会让模型重试，白捡）；② 字段级**确定性**清洗（`"¥12.00"` → `Decimal("12.00")`，
+可枚举可单测）；③ run 级重试（**必须新建 BrowserSession**）；④ 拒绝入库 + quarantine。
+**明确不做第五档：让 LLM 去修解析失败的结果。**
+
+**为什么不做**：修复需要第二次 LLM 调用。真正的问题是 —— **修复后的值由谁负责？**
+如果修复"成功"，库里存的是一个**经过 LLM 二次加工**的值，而它和页面上真实的值
+是什么关系，**没有任何人知道**。对一个电商卖家后台的数据，这比"没采到"严重得多：
+卖家可能拿着这个数去做补货决策。所以：解析失败 = 这个 run 失败，
+raw 原文留着、报告里标红、让人去看。
+
+**代价**：成功率会低一些（有些本来"救一救还能用"的数据直接判失败），而且需要人来看。
+这是**有意接受**的成本，不是没优化。
+
+**证据在哪**：`tests/test_runner_offline.py::test_classify_parse_status`、
+`test_should_retry_ok_never_and_schema_invalid_always`（重试策略的白名单：只有特定
+`parse_status` 才重试 —— 撞护栏那种 `blocked` **不重试**，因为重试只会再撞一次，纯烧 token）、
+`test_extract_structured_catches_validation_error_as_quarantine`。
+
+---
+
+## ADR 11 · 为什么 quarantine 整体拒绝，而不是部分插入；为什么 `suspicious` 只标记不删除
+
+**决定**：一次 run 的产物**要么整批入库、要么整批不入**（`parse_status='schema_invalid'`，
+`products` 表零行，raw 原文保留）。已经入库的行里，`price <= 0` / `stock < 0` /
+`title` 空 / `goods_id` 非数字 → 打 `suspicious=1`，**只标记，不删除**。
+
+**为什么整体拒绝**：部分插入会让"这个 run 的数据全不全"变成一个**必须先看
+`parse_status` 才知道**的问题 —— 而下游查询不会去看。宁可能力小一点，
+也不产生一张"看起来完整、实际缺行"的表。
+
+**为什么只标记不删除**：删掉就**再也看不到"LLM 出错的方式"**，而那恰恰是最该看的东西
+（它告诉你下一条规则该加在哪）。`suspicious` 是给人和报告看的信号。
+
+**代价**：
+- 表里**会存在可疑数据**，所以下游必须知道这一列 —— 不知道就会照单全收。
+- 整体拒绝意味着**一条坏行能废掉整个 run 的入库**。这个交换是有意的：
+  "整个 run 失败"是响的，"少了几行"是哑的。
+
+**证据在哪**：`ecom_agent/store/schema.sql`（`parse_status` 与 `suspicious` 两列）、
+`ecom_agent/store/repository.py:336`（`suspicious` 由 flags 推出，不是人手填的）、
+`ecom_agent/sites/pinduoduo/output_models.py:85`（`sanity_flags()`）；
+`tests/test_runner_offline.py::test_extract_structured_catches_validation_error_as_quarantine`
+（整体拒绝那条）。
+
+⚠️ **这里有一条诚实缺口，写 ADR 时核出来的**：`sanity_flags()` / `_detect_pii()` /
+`pii_flags` / `suspicious` **目前一条测试都没有**（全库 grep 只在 tests 里命中过一段
+不相干的 SQL fixture）。也就是说：**"可疑数据只标记不删除"这条原则，代码里有、
+测试里没有**。按本文档开头的第三条规矩，这里写"不知道"而不是写一个漂亮的名字 ——
+它已经进了 README 的「这个项目**没做到**的事」，补测试是明确待办。
