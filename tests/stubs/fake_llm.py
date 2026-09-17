@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, get_args
 
 from browser_use.agent.views import AgentOutput, JudgementResult
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
@@ -67,13 +67,28 @@ class FakeLLM:
             {"done": {"text": "完成", "success": True}},
         ])
         agent = Agent(task="...", llm=llm, browser=session)
-        llm.bind(agent)          # ★ 必须调一次：拿 registry 才能造 action
+        llm.bind(agent)          # ★ 只有走 make_agent() 时才需要（见下）
         await agent.run()
 
-    ★ 为什么 bind 是必须的而不是构造参数：
-      ActionModel 是由 registry 在 Agent.__init__ 里动态创建的
-      （agent/service.py:783），所以 llm 构造时那个类还不存在。
-      与其猜形状，不如从 registry 自己取 —— 这样库加/改动作时桩自动跟上。
+    ★ `bind` 是**可选**的，不再是必须的 —— 这里踩过一个坑：
+
+      原来 `_build_output` 无条件读 `self._registry.registry.actions` 来校验
+      脚本里的动作名，于是"忘了 bind" 就等于"每步都抛
+      `'NoneType' object has no attribute 'registry'`"。
+
+      而这条路径**恰好会在 e2e 里被走到**：`run_task()` 自己造 Agent
+      （runner.py:496），它当然不会去调一个测试桩的 `bind`。表现是
+      "Result failed 1/6 … 6/6 times" + "Stopping due to 5 consecutive failures"，
+      而报错文本里只有那句 AttributeError，指不到"桩没绑定"。
+
+      现在的做法是从**库当步递下来的 `output_format`** 里取动作名：
+      它的 `action` 字段是 `list[ActionModel]`，而每个成员模型只有一个字段、
+      字段名就是动作名（`create_action_model`，registry/service.py:555-559）。
+      这条路比查注册表**更准**：库会按当前页面过滤动作
+      （`create_action_model(page_url=...)`），所以它回答的是
+      "这一步允许什么"，而注册表只能回答"这个动作存不存在"。
+      注册表保留为退路（被 bind 过且拿不到 output_format 时用），
+      两条都拿不到就跳过校验 —— 库自己的 union 校验仍然会拦住错的动作名。
     """
 
     script: list[ScriptItem] = field(default_factory=list)
@@ -261,17 +276,41 @@ class FakeLLM:
           用库给的那个，等于连 schema 这一层也走了真实路径。
         """
         output_cls = output_format or AgentOutput
+        known = self._known_action_names(output_cls)
         for action in actions:
             for name in action:
-                if name not in self._registry.registry.actions:
-                    known = sorted(self._registry.registry.actions)
-                    raise KeyError(f"脚本里写了不存在的动作 {name!r}；可用动作：{known}")
+                if known and name not in known:
+                    raise KeyError(f"脚本里写了这一步不允许的动作 {name!r}；可用动作：{sorted(known)}")
         return output_cls(
             evaluation_previous_goal="(fake)",
             memory="(fake)",
             next_goal=f"(fake) 第 {len(self.calls)} 步",
             action=[dict(a) for a in actions],
         )
+
+    def _known_action_names(self, output_cls: Any) -> set[str]:
+        """这一步允许的动作名。★ 见类 docstring 里关于 `bind` 的说明。
+
+        取法：`output_cls.model_fields["action"].annotation` 是
+        `list[ActionModel]`（库当步递下来的收窄 schema），动作名从那个
+        `ActionModel` 里取 —— 两种形状的展开见 `_action_names_of`。
+
+        ⚠️ 这里刻意**不**在拿不到时抛：拿不到（形状又变了）就返回空集、
+          跳过校验，让库自己的 union 校验去报错。桩的辅助校验失灵
+          绝不该表现成"整套 e2e 崩了"。
+        """
+        field = (getattr(output_cls, "model_fields", None) or {}).get("action")
+        if field is None:
+            return set()
+        args = get_args(getattr(field, "annotation", None))
+        if args:
+            names = _action_names_of(args[0])
+            if names:
+                return names
+        # 退路：被 bind 过的话，注册表也能回答（但它是全局的，不区分页面）
+        if self._registry is not None:
+            return set(getattr(getattr(self._registry, "registry", None), "actions", None) or {})
+        return set()
 
     def _wrap(self, completion: Any) -> ChatInvokeCompletion:
         # ★ usage 必须显式传：ChatInvokeCompletion.usage 是【无默认值的必填字段】
@@ -311,6 +350,35 @@ class FakeLLM:
 
     def total_image_parts(self) -> int:
         return sum(c.image_part_count() for c in self.calls)
+
+
+def _action_names_of(action_model: Any) -> set[str]:
+    """从一个动态造出来的 `ActionModel` 里取出动作名。
+
+    ★★ 两种形状都要认（`create_action_model`，registry/service.py:569-590）：
+
+      · **只有一个动作可用** → 直接返回那个单字段模型，字段名就是动作名；
+      · **两个及以上** → 包成 `ActionModelUnion(RootModel[Union[...]])`，
+        此时**它自己的字段只有一个 `root`**，动作名藏在 `root` 的 union 成员里。
+
+      只认第一种的代价是实测过的：拿到的答案是 `可用动作：['root']` ——
+      一个看起来像"库坏掉了"的答案，而真相是这里少下潜了一层。
+      在 1 个和 ≥2 个动作之间横跳的形状差别，是这类动态模型的通病。
+
+    ★ 空集是**合法**返回：没有任何动作可用时库返回 `EmptyActionModel`，
+      调用方据此跳过校验（库自己的 union 校验仍然兜底）。
+    """
+    fields = getattr(action_model, "model_fields", None) or {}
+    names = set(fields) - {"root"}
+    if names:
+        return names
+    root = fields.get("root")
+    if root is None:
+        return set()
+    out: set[str] = set()
+    for member in get_args(getattr(root, "annotation", None)):
+        out |= set(getattr(member, "model_fields", None) or {})
+    return out
 
 
 def _is_agent_output(output_format: Any) -> bool:

@@ -1,0 +1,169 @@
+# 本地 mock 卖家后台 —— Phase 4 的 e2e 载体，只读采集
+#
+# ★ 它和 books_demo.yaml 的分工：
+#     books_demo       → 真网络、真站点，验证"链路能不能通"（要联网）
+#     mock_shop_readonly → 本地 mock，验证"护栏、提取、落库在真实浏览器里
+#                          端到端成立"（零网络、零登录、CI 可跑）
+#
+#   为什么要另起一份而不是复用 pdd_search_products.yaml：
+#     · 白名单不同（那份是 mms.pinduoduo.com）
+#     · 更重要的是【护栏规则的 URL 作用域不同】。真站点那份的 allow-readonly
+#       绑在 "*mms.pinduoduo.com/*" 上，在 127.0.0.1 上一条规则都不命中，
+#       于是每一次"点搜索"都会落到 default_decision=confirm —— e2e 会变成
+#       一条人工点击流水线（这条推论有可执行证据：
+#       tests/test_browser_contract.py 末尾那条断言『搜索』应为 confirm）。
+#
+# ★★ 这份文件里有一条规则是【特意写窄】的，见 allow-readonly 上的注释。
+
+schema_version: "1"
+id: mock.shop_readonly
+name: 本地 mock 卖家后台 - 商品列表只读采集
+site: mock
+
+requires_login: false
+
+# ★ 这是一个占位端口，**e2e 会在运行时覆盖它**。
+#   理由：mock 站点用 port=0 让 OS 分配端口（避免 CI 上端口冲突），
+#   而 TaskSpec.start_url 是普通字符串，没有占位符替换 —— 只有
+#   goal/steps/分页那几处会替换（见 dsl/models.py 的 templated_texts）。
+#   所以测试要 `spec.model_copy(update={"start_url": f"{base}/goods/goods_list"})`。
+#
+#   刻意不写成 "http://127.0.0.1:0/..."：`0` 是一个能通过 URL 校验、
+#   但一定连不上的端口。忘了覆盖时，它会表现为一次明确的连接失败
+#   （"连不上 8765"），而不是一个看起来正常的空页面。
+#   用 8765 是 server.py 的 `main()` 手动起服务时的端口 ——
+#   所以"忘了覆盖"这条路上，人肉起一个 mock 就能把它跑通，
+#   而不是必须先读懂这一整段注释。
+start_url: "http://127.0.0.1:8765/goods/goods_list"
+
+goal: >-
+  在商品管理列表页读取商品数据，最多提取 {limit} 条，
+  每条读取商品ID、商品标题、售价、库存、状态五个字段。
+
+steps:
+  - "确认已经在商品管理列表页。若出现登录页，立刻停止并调用 done 汇报'需要人工登录'，不要尝试输入账号密码。"
+  - "用 extract_table 读取页面上的商品表格，不要凭记忆抄写。"
+  - "只读，不要点击任何'删除''批量删除''下架''立即支付''编辑'按钮。"
+  - "整个过程中不要修改任何商品数据。你的任务是只读采集。"
+
+params:
+  keyword:
+    type: string
+    default: ""
+    description: "商品搜索关键词；留空表示不过滤"
+  limit:
+    type: integer
+    default: 5
+    ge: 1
+    le: 40
+    description: "最多提取多少条"
+
+output_model: pdd.ProductRowList
+output_model_version: 1
+
+pagination:
+  mode: click_next
+  max_pages: 1
+  # ★ max_pages=1 是刻意的：这份模板的用途是**验证护栏与提取链路**，
+  #   不是演示翻页。多翻一页就多一步、多一次截图、多一次 LLM 调用，
+  #   而"翻页到底"这条语义已经有 data.py 的纯函数单测覆盖了
+  #   （page_of 越界回空、total_pages 空结果算 1 页）。
+  #   把成本花在护栏上，而不是花在翻页上。
+  next_selector_hint: "分页条右侧的'下一页'；渲染成灰色不可点的文字表示已到最后一页"
+  stop_when: "已收集满 {limit} 条，或'下一页'不可点"
+
+retry:
+  max_attempts: 1
+  # ★ 不重试。理由：这份模板的失败模式里，最要紧的是
+  #   "护栏挡了不该挡的 / 没挡住该挡的" —— 那是**确定性**的问题，
+  #   重试只会把同一个结论再验一遍，代价是再来一整轮浏览器启动 + token。
+  #   而"网络抖动"在这份模板里根本不存在（服务在本机、进程内）。
+  step_max_failures: 3
+  on_empty_result: accept
+
+observability:
+  screenshot: true
+  record_llm_io: true
+  # ★ 空列表：mock 站点上没有真实店铺名要盖。
+  #   这里的值会进 Redactor 的字面值词表，写进去一个 mock 上不存在的词
+  #   只会让"脱敏生效了吗"这条测试失去可证伪性
+  #   （见 tests/test_redact.py 的对照实验：先断言输入确实含真值）。
+  redact_extra: []
+
+guardrails:
+  # ★ 只白名单 127.0.0.1，不留任何站外口子。
+  #   S7 验过：它能匹配 http://127.0.0.1:PORT（端口被忽略），
+  #   而**同一台服务器**换主机名 localhost 会被拦 —— 后者是白名单真的在
+  #   按域名判定的证据（tests/test_browser_contract.py 里那条带对照组的断言）。
+  allowed_domains:
+    - "127.0.0.1"
+  prohibited_domains: []
+
+  # ★ 和 books_demo 一样保持 confirm，不为"跑得顺"改成 allow。
+  #   CI 必须跑在与真实使用同一份策略上，否则测出来的绿不能代表任何事。
+  default_decision: confirm
+
+  max_consecutive_blocks: 3
+
+  rules:
+    # ── 拦截类 ──────────────────────────────────────────
+    - id: block-destructive
+      decision: block
+      reason: "破坏性/不可逆操作，会改店铺真实数据"
+      match_action: [click]
+      # ★ 不带 match_url：破坏性规则的适用范围应该是**任何站点**。
+      #   绑到 127.0.0.1 上看着更"精确"，实际是把它变成一个只在一个
+      #   mock 主机上生效的规则 —— 而它是这套规则里最不该被削弱的一条。
+      match_element_text: "删除|批量删除|下架|清空|重置|解绑|注销|退出登录"
+
+    # ── 确认类 ──────────────────────────────────────────
+    - id: confirm-money
+      decision: confirm
+      reason: "资金相关，必须人工二次确认"
+      match_action: [click]
+      match_element_text: "立即支付|提交订单|确认付款|打款|提现|充值|续费|购买"
+
+    - id: confirm-edit
+      decision: confirm
+      reason: "写入类操作，本任务本应只读；确认是否误触"
+      match_action: [click]
+      match_element_text: "编辑|修改|保存"
+
+    # ── 放行类 ──────────────────────────────────────────
+    - id: allow-readonly
+      decision: allow
+      reason: "本机 mock 站点上的只读检索类操作"
+      match_action: [navigate, input, click, scroll, extract, extract_table, go_back]
+      match_url: "*127.0.0.1*"
+      # ★★ 这一条【故意不写 match_element_text】，而 pdd / books 两份模板里
+      #    都写了。这不是遗漏，是发现了一个真实的静默失效之后改的：
+      #
+      #    规则引擎的四个匹配维度是 AND（guardrails/rules.py:103-145），
+      #    而 `match_element_text` 在拿不到元素文本时**判定为不命中**
+      #    （rules.py:117-124，是刻意的：把 None 当空串会让写错的规则拦死一切）。
+      #    而 `extract_table` 是**不针对任何元素**的动作 —— 它的参数是
+      #    table_index/max_rows，没有元素文本可拿。
+      #
+      #    两者相乘的结论是：任何同时写了 match_action 含 extract_table
+      #    **和** match_element_text 的 allow 规则，永远不可能匹配 extract_table。
+      #    它躺在 YAML 里、编译进 task_text、报告里显示"策略已加载"，
+      #    而它一次都没生效过。
+      #
+      #    另外那两份模板（pdd / books）当时也各留着一条这样的死条目 ——
+      #    查下去才发现**范围比预想的大得多**：`extract` / `go_back` /
+      #    `send_keys` 全都在同一类里（判据是"参数里有没有 index"，
+      #    不是"是不是 extract_table"）。已于 2026-09-17 一起处置：
+      #    按"判据能不能用"把放行拆成两条 —— 这条模板当年就是那个形态，
+      #    现在三份模板是同一个形态了。
+      #    完整经过：docs/spikes.md 的「事实 5」。
+      #
+      #    ⚠️ 这份模板**不覆盖键盘动作**：它没有 block-destructive-keys /
+      #    allow-readonly-keys（e2e 的脚本不用 send_keys）。
+      #    所以这里的 send_keys 落到 default_decision=confirm ——
+      #    将来若往本模板的任务里加按键盘的步骤，要照着 pdd 那两条补上。
+
+agent:
+  use_vision: false
+  max_actions_per_step: 2
+  max_steps: 12
+  max_failures: 5

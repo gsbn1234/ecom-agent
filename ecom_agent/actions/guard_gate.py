@@ -22,8 +22,18 @@
      所以护栏**不能**只靠库的 max_failures 来兜底 —— 它会因为别的原因（网络抖动）先被耗尽。
      拦截器自己维护 `policy.record_block()` 的连续计数，到上限就硬停（见 interceptor.py）。
 """
-from __future__ import annotations
-
+# ★★ 本模块【刻意】不写 `from __future__ import annotations`。
+#   库在**注册期**用 inspect 读注解并跟自己那份特殊参数类型表做 `==` 比较，
+#   PEP 563 会把注解变成字符串，于是比较恒为 False、注册直接抛一句
+#   "conflicts with special argument injected by tools: 'browser_session: BrowserSession'"
+#   —— 报错两边长得一模一样，极难定位。
+#
+#   ⚠️ 这个坑**取决于 action 有没有特殊参数**，不取决于有没有写那行 import：
+#      本模块的 guard_notice 只收一个 message，所以带着 future import 也能跑。
+#      正因如此，照着本模块抄一个**带 browser_session 的** action 就会炸。
+#      完整实测与对照实验记在 extract_table.py 顶部。
+#
+#   统一的规矩：**凡是定义 action 的模块，都不写 future import。**
 from typing import Any
 
 from browser_use import ActionResult, Tools
@@ -69,17 +79,13 @@ def make_notice_action(action_model: Any, message: str) -> Any:
     return action_model.model_validate({GUARD_NOTICE_ACTION: {"message": message}})
 
 
-def build_tools(*, exclude_actions: list[str] | None = None) -> Tools:
-    """造一个 Tools 实例，并注册本项目的自定义 action。
+def register_guard_notice(tools: Tools) -> None:
+    """把 `guard_notice` 注册进一个**已有的** Tools 实例。
 
-    ★ 必须在**构造 Agent 之前**调用，并把结果通过 `Agent(tools=...)` 传进去。
-      原因：`ActionModel` 是 Agent 构造时按注册表生成的
-      （`AgentOutput.type_with_custom_actions(self.ActionModel)`，`service.py:786-790`）。
-      注册晚了，那个模型里就没有 `guard_notice` 这个字段，
-      `make_notice_action` 的 `model_validate` 会抛 ValidationError
-      —— 那是**好事**（报错而不是静默），但报错发生在 run 已经跑起来之后。
-      所以还要在启动期查一次：`verify_notice_round_trip()`。
-      （这一条的对照实验在 tests/test_guard_gate.py。）
+    ★ 它由 `ecom_agent/actions/__init__.py` 的 `build_tools()` 统一编排调用。
+      为什么清单在那边而不在这里：那里同时看得见所有 action 模块，
+      而"本项目注册了哪些动作"必须是一个能一眼读完的清单
+      （护栏的 `match_action` 引用了没注册的动作时，那条规则会**永远不命中**）。
 
     ★★ 装饰器挂在**实例**上（`tools.action`）而不是类上（`Tools.action`）：
       `Tools.action` 是实例方法（`tools/service.py:2100`
@@ -91,7 +97,6 @@ def build_tools(*, exclude_actions: list[str] | None = None) -> Tools:
       照着报错去补 description 只会越修越远。
       所以顺序必须是：**先有 Tools 实例，再注册**。
     """
-    tools = Tools(exclude_actions=list(exclude_actions or []))
 
     @tools.action(
         "系统拒绝了一个动作时用它说明原因。你不应该主动调用它。",
@@ -102,8 +107,6 @@ def build_tools(*, exclude_actions: list[str] | None = None) -> Tools:
     )
     def guard_notice(message: str) -> ActionResult:
         return ActionResult(error=message)
-
-    return tools
 
 
 def verify_notice_round_trip(action_model: Any) -> None:

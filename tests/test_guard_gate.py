@@ -21,9 +21,9 @@ import pytest
 from browser_use import Tools
 
 from ecom_agent import compat
+from ecom_agent.actions import build_tools
 from ecom_agent.actions.guard_gate import (
     GUARD_NOTICE_ACTION,
-    build_tools,
     make_notice_action,
     verify_notice_round_trip,
 )
