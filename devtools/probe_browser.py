@@ -72,6 +72,35 @@ CDP_TIMEOUT_S = 15.0
 # 留够余量以免我们把库的超时伪装成自己的超时。
 LIBRARY_TIMEOUT_S = 90.0
 
+# 结论文件的版本号。★ 为什么要版本号：下游的 gate 要按字段读它，
+# 而"字段没了"和"字段是 false"在读的时候长得一样 ——
+# 有版本号就能明确区分"格式变了"和"结论变了"。
+VERDICT_VERSION = 1
+
+
+def _write_verdict(path: str | None, verdict: dict) -> None:
+    """把结论写成机器可读的一份 JSON。★ 仍然 exit 0，这个函数不返回码。
+
+    ★★ 为什么探针要额外给一份机器可读的结论，而不是让 gate 去 grep 注解：
+      注解是**给人看的散文**（"第一段：按库的参数能起 Chromium 且 CDP 就绪 → …"），
+      让 gate 去匹配那段中文，等于把一句文案变成一个程序接口 ——
+      文案一改（哪怕只是改个标点），gate 就静默地永远判错。
+      而它判错的后果是**把红的测试说成环境问题**，也就是让 CI 放过真的坏事。
+      人读的和机器读的必须是两份东西。
+
+    ★ 写不进去不抛：探针的职责是说明，不是判决。写失败会被 gate 那边
+      按"结论缺失"处理（→ 按坏消息处理），不会静默变成好消息。
+    """
+    if not path:
+        return
+    try:
+        Path(path).write_text(
+            json.dumps(verdict, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"\n结论已写入 {path}: usable={verdict.get('usable')} ({verdict.get('reason')})")
+    except Exception as e:  # noqa: BLE001
+        print(f"\n⚠️ 结论写不进 {path}（{type(e).__name__}: {e}）—— gate 会按『结论缺失』处理")
+
 
 def _ann(kind: str, msg: str) -> None:
     """打印一行注解，并回显到 stdout。
@@ -373,6 +402,32 @@ def main() -> int:
     if argv and argv[0] == "--fatal-lines":
         return _forensics(argv[1] if len(argv) > 1 else "/tmp/chrome_capture.log")
 
+    # ★ `--verdict-json <路径>`：额外落一份机器可读的结论（见 _write_verdict）。
+    #   和 --fatal-lines 平级，都是"同一份知识、不同的出口"。
+    verdict_path: str | None = None
+    if "--verdict-json" in argv:
+        i = argv.index("--verdict-json")
+        verdict_path = argv[i + 1] if len(argv) > i + 1 else "/tmp/browser_verdict.json"
+
+    # ★★ 结论的**默认值**是 usable=True，这不是随手写的：
+    #    它是 fail-closed 的方向 —— 探针自己崩了/字段缺了/文件没写出来，
+    #    一律按"环境是好的"处理，于是下游 gate 会把红的测试当成真红。
+    #    ⚠️ 反过来（默认 usable=False）的后果严重得多：探针出任何问题都会
+    #       让 gate 把真实的测试失败说成"环境问题"，从而把红**洗成绿**。
+    #       一个能自动把红洗成绿的机制，比没有这个机制危险得多。
+    #    同 guardrails 的 default_decision=confirm：拿不准时选"更严"的那边。
+    V: dict = {
+        "verdict_version": VERDICT_VERSION,
+        "usable": True,
+        "reason": "探针没有得出否定结论（默认按可用处理）",
+        "chrome_found": None,
+        "chrome_path": "",
+        "stage1_self_launch": None,
+        "stage2_library_launch": None,
+        "stage2_error": None,
+        "fatal_lines": [],
+    }
+
     print("=" * 70)
     print("浏览器探针")
     print("=" * 70)
@@ -395,11 +450,15 @@ def main() -> int:
     #   等于把排查又推回 CI 那一轮 5 分钟的往返。
     probed = find_chrome_executable()
     browser_path = CHROME_PATH or probed
+    V["chrome_found"] = bool(browser_path)
+    V["chrome_path"] = str(browser_path or "")
     print(f"\nconfig.CHROME_PATH          -> {CHROME_PATH or '(空，回退到自动探测)'}")
     print(f"find_chrome_executable()    -> {probed}")
     print(f"实际使用                    -> {browser_path}")
     if not browser_path:
         _ann("warning", "browser-use 找不到 Chrome —— 下游浏览器测试的红是【环境问题】，不是代码问题")
+        V.update(usable=False, reason="browser-use 找不到任何 Chrome 可执行文件")
+        _write_verdict(verdict_path, V)
         return 0
     print(f"版本      : {_chrome_version(browser_path)}")
     _ann("notice", f"browser-use 探测到的 Chrome: {browser_path}")
@@ -445,6 +504,7 @@ def main() -> int:
     verdict, stderr, code = asyncio.run(_try_launch(browser_path, args, port))
     print(f"\n启动结论  : {verdict}   退出码: {code}")
     print(f"Chrome 的 stderr: {stderr or '（空）'}")
+    V["stage1_self_launch"] = verdict
 
     if verdict == "cdp_ok":
         _ann("notice", "第一段：按库的参数能起 Chromium 且 CDP 就绪 → 环境没问题，差别在库的启动方式")
@@ -558,6 +618,54 @@ def main() -> int:
         _ann("error", f"第二段：库自己的启动失败（退出码 {lib.get('returncode')}，死因见 Chrome 死因行）")
     else:
         _ann("error", f"第二段：库自己的启动失败。异常={lib.get('error') or '?'}")
+
+    # ── 6. 机器可读的结论：这台机器到底能不能跑浏览器测试 ──
+    #
+    # ★★ 判据刻意**窄**，这是本文件最需要说清楚的一处取舍。
+    #
+    #   判"环境不可用"的唯一条件是：**两条路都起不来**
+    #     · 探针自己按库的参数起（第一段）失败，且
+    #     · 库自己的启动路径（第二段）也失败；
+    #   或者压根找不到 Chrome。
+    #
+    #   为什么不把"第一段成功、第二段失败"也判成环境不可用 —— 明明那时
+    #   测试也跑不起来：
+    #     那正是 Phase 3 那次 CI 全红的形态（库挑中了 /usr/bin/chromium，
+    #     探针挑的是 /usr/bin/google-chrome，两者不是同一个二进制）。
+    #     它看起来像环境问题，实际是**我们自己的配置不一致**，
+    #     是我们的问题、也该由我们看见。把它归进"环境坏了"等于
+    #     把这一类**唯一能靠改配置修掉**的故障藏起来。
+    #
+    #   ★ 这个判据能生效的前提是它必须**窄**：环境不可用 → gate 放绿，
+    #     所以每放宽一格，就多一类真失败可能被洗成绿。
+    #     "红能被解释掉"这件事本身没有价值，除非那个解释是可证的。
+    if not V["stage1_self_launch"] == "cdp_ok" and not lib.get("ok"):
+        V.update(
+            usable=False,
+            reason=(
+                "两条路都起不来：探针自起="
+                f"{V['stage1_self_launch'] or '未跑'}、库自己的启动路径=失败"
+            ),
+        )
+    elif lib.get("ok"):
+        V.update(usable=True, reason="库自己的启动路径成功 → 这台机器能跑 needs_browser")
+    else:
+        V.update(
+            usable=True,
+            reason=(
+                "探针能起、库的路径起不来 —— 判成**可用**（于是 gate 会当真红）："
+                "两者不一致属于我们自己的配置问题，不是环境坏了"
+            ),
+        )
+    V["stage2_library_launch"] = bool(lib.get("ok"))
+    V["stage2_error"] = lib.get("error")
+    V["fatal_lines"] = fatal_lines(log_text)[:6]
+    V["sandbox_matrix"] = {k: v[0] for k, v in (matrix or {}).items()}
+    _ann(
+        "notice" if V["usable"] else "warning",
+        f"探针结论：环境{'可用' if V['usable'] else '不可用'} —— {V['reason']}",
+    )
+    _write_verdict(verdict_path, V)
     return 0
 
 

@@ -72,23 +72,43 @@ jobs:
           fi
           exit "$code"
 
-  # ── 浏览器门禁：尽力跑，失败不阻塞 ──────────────────────────────
+  # ── 浏览器门禁：环境问题放行，代码问题真红 ──────────────────────
   #
-  # ★ 为什么单独一个 job 且 continue-on-error：
-  #   browser-use 要在 CI 里启动真实 Chromium。这依赖 runner 的沙箱设置、
-  #   Chrome 版本、以及一组 apt 包，任何一环变化都会让它红 —— 而那是
-  #   【环境问题，不是代码问题】。把它和离线门禁混在一个 job 里，
-  #   会让"代码坏了"和"CI 机器没配好"看起来一模一样，久而久之没人看 CI。
+  # ★★ 这里在 2026-09-17 改过一次姿态，理由值得完整写下：
+  #
+  #   原来这个 job 是 `continue-on-error: true`（job 级）—— 于是它**永远不会红**。
+  #   后果不是"容忍了偶尔的失败"，而是**这个 job 的结论不再携带任何信息**：
+  #   "浏览器测试挂了两周"和"浏览器测试一直绿"在 GitHub 页面上长得一模一样。
+  #   一个永远绿的绿灯和没有灯是同一种东西。
+  #
+  #   但直接把开关删掉也不行：CI runner 上起真实 Chromium 依赖沙箱、Chrome 版本、
+  #   一组 apt 包，任何一环变了都会红，而那是【环境问题不是代码问题】。
+  #   删掉的后果是"CI 经常红"—— 而老是红的 CI 比老是绿的 CI 更糟，
+  #   因为它更吵，且同样会被忽略。
+  #
+  #   ★ 所以改法是**分辨**而不是**豁免**（判别逻辑在 devtools/ci_gate.py）：
+  #
+  #       环境不可用 + 测试红  →  warning 注解 + 绿（continue-on-error 放行）
+  #       环境可用   + 测试红  →  ::error:: + 真红（gate 步骤 exit 1）
+  #       测试绿               →  绿
+  #
+  #   具体做法：continue-on-error 从 **job 级降到步骤级**（只给"可能会因为环境
+  #   而失败的步骤"），最后加一步 gate —— 它自己**没有** continue-on-error，
+  #   所以 job 的颜色由它决定。
+  #
+  #   ⚠️ 这个机制唯一能把红洗成绿的地方，就是 gate 判"环境不可用"。
+  #      所以那条判据刻意写得**很窄**（两条启动路径都起不来才算），
+  #      且结论缺失一律按"可用"处理（→ 真红）。详见 ci_gate.py 的 docstring。
   #
   # ★ 为什么不干脆不跑：
   #   完全不跑的话，浏览器路径的代码在 CI 上零覆盖，而它恰恰是最容易坏的部分。
-  #   "本地是硬门禁，CI 是尽力跑"—— 这个区别明确写出来，比假装 CI 全绿诚实，
+  #   "本地是硬门禁，CI 是有分辨地跑"—— 这个区别明确写出来，比假装 CI 全绿诚实，
   #   也比直接删掉这个 job 负责。
   browser:
-    name: 浏览器测试（尽力跑）
+    name: 浏览器测试（环境问题放行，代码问题真红）
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: true
+    # ★ 注意这里**没有** continue-on-error —— 它由最后那个 gate 步骤决定。
     # ★ env 放在 job 层而不是各 step 层 —— 这是本轮排查换来的教训：
     #   之前探针步骤没有 env、测试步骤有一份，于是【两者测的不是同一个浏览器】，
     #   探针报"环境没问题"而测试照红，白烧了两轮 CI。
@@ -137,6 +157,7 @@ jobs:
           pip install -e ".[dev]"
 
       - name: 装 Chromium 依赖（失败继续，不影响后续步骤的结论）
+        continue-on-error: true
         run: |
           sudo apt-get update -qq || true
           sudo apt-get install -y -qq libnss3 libatk-bridge2.0-0 libgtk-3-0 \
@@ -158,10 +179,25 @@ jobs:
       #   所以探针改成"按同样的二进制、同样的 get_args() 自己起一次，自己读 stderr"。
       #   这份脚本本地也能跑，且用的是和测试同一条 Chrome 解析顺序（config.CHROME_PATH）。
       - name: 探测浏览器（把"环境坏了"和"代码坏了"分开）
-        run: python devtools/probe_browser.py
+        id: probe
+        # ★ 步骤级 continue-on-error：探针自己失败（脚本崩了）不该是这个 job 的红 ——
+        #   它的职责是【说明】不是【判决】。它给的结论由下面的 gate 读。
+        #   （探针的契约本来就是 exit 0，这里是防"脚本自己崩了"那一档。）
+        continue-on-error: true
+        run: |
+          python devtools/probe_browser.py --verdict-json /tmp/browser_verdict.json
+          # ★ 探针的结论是给机器读的，注解是给人读的，两份不同的东西 ——
+          #   让 gate 去 grep 那句中文注解，等于把一句文案变成程序接口：
+          #   改个标点就静默判错，而判错的后果是把红说成环境问题。
+          echo "── 探针结论 ──"
+          cat /tmp/browser_verdict.json || echo "（结论文件没写出来 —— gate 会按『环境可用』处理，也就是真红）"
 
       - name: 跑浏览器测试
         id: browser_tests
+        # ★★ 步骤级 continue-on-error：它允许这一步失败并让 job 继续 ——
+        #    关键是**别让这一步自己决定 job 的颜色**，那是下面 gate 的事。
+        #    （原来这个开关在 job 级，于是 job 永远不会红。）
+        continue-on-error: true
         run: |
           set +e
           # ★ 与 offline job 同款参数，理由见那边（-rf 保证失败清单落在 tail 里；
@@ -225,14 +261,42 @@ jobs:
         if: always() && steps.browser_tests.outcome == 'failure'
         run: python devtools/probe_browser.py --fatal-lines /tmp/chrome_capture.log
 
+      # ★★ 门禁：这一步**决定这个 job 的颜色**，所以它自己【没有】continue-on-error。
+      #
+      #   判据、默认值方向、以及"为什么判据必须窄"，全部写在
+      #   devtools/ci_gate.py 的 docstring 里 —— 这里只传两个事实进去：
+      #     1. 上一步的 outcome（注意是 outcome 不是 conclusion：
+      #        步骤级 continue-on-error 时 outcome='failure' 而 conclusion='success'，
+      #        我们恰恰要前者，后者是被开关抹平之后的假象）；
+      #     2. 探针那份机器可读的结论。
+      #
+      #   ★ 为什么判别逻辑在脚本里而不是这几行 shell 里：
+      #     它是一条**有真假**的判断，不是一次 IO。写成 shell 就只能靠
+      #     "往 main 推一次坏提交看颜色"来验，而那种验证不可复现，
+      #     而且**验不了反面**（没法在 CI 上故意让环境坏掉）。
+      #     放进 tests/test_ci_gate.py 之后，真值表 + 两条对照实验在本地毫秒级可验。
+      #     同 --fatal-lines 那条纪律：CI 只决定【什么时候】去看，不决定【怎么看】。
+      - name: 门禁（环境问题放行，代码问题真红）
+        if: always()
+        run: |
+          python devtools/ci_gate.py \
+            --tests-outcome "${{ steps.browser_tests.outcome }}" \
+            --verdict-json /tmp/browser_verdict.json
+
       - name: 把结论写进 job summary（即使失败也执行）
         if: always()
         run: |
           {
             echo "### 浏览器门禁"
             echo ""
-            echo "本 job 是 \`continue-on-error: true\`，红不代表代码坏了。"
-            echo "本地必须过：\`pytest -m needs_browser\`"
+            echo "| 情况 | 结果 |"
+            echo "|---|---|"
+            echo "| 环境不可用 + 测试红 | warning 注解 + 绿 |"
+            echo "| 环境可用 + 测试红 | error 注解 + **真红** |"
+            echo "| 测试绿 | 绿 |"
+            echo ""
+            echo "本 job **不再是** \`continue-on-error\`：颜色由最后那个 gate 步骤决定。"
+            echo "本地硬门禁：\`pytest -m needs_browser\`"
             echo ""
             echo "★ 失败原因在【本页的 Annotations 面板】里，不在日志里 ——"
             echo "日志接口要 admin 权限（公开仓库也一样），job summary 不进公开 HTML，"
