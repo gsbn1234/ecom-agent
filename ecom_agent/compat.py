@@ -314,6 +314,43 @@ def page_changing_actions(tools: Any) -> set[str]:
     return {name for name, a in actions.items() if getattr(a, "terminates_sequence", False)}
 
 
+def index_bearing_actions(tools: Any) -> set[str] | None:
+    """哪些动作**结构上可能**带元素文本 —— 参数模型里声明了 `index` 的那些。
+
+    ★★ 为什么需要这个：护栏的 `match_element_text` 判据只在
+      「拿得到动作落在哪个元素上」时才有意义，而那个值唯一来源是**参数里的
+      `index`**（`guardrails/interceptor.py:_text_for` 只读这一个键）。
+      于是 `extract` / `go_back` / `extract_table` 这类**不针对任何元素**的动作
+      永远拿不到文本，而 `rules.py:117-124` 把"拿不到文本"判成**不命中**。
+
+      两者相乘的结论：**任何同时写了 `match_element_text` 和这类动作名的规则，
+      对那个动作永远不可能命中。** 它躺在 YAML 里、编译进 task_text、
+      报告里显示"策略已加载"，一次都没生效过 —— 彻头彻尾的静默。
+
+    ★ 为什么反映到参数模型上而不是自己列一张"没有元素文本的动作"名单：
+      同 `page_changing_actions` 的理由 —— 这库在 0.13.x 就把 `go_to_url`
+      改成了 `navigate`。自己列名单的话，名单会**静默失配**，
+      而这个检查恰恰是防静默失配用的，它自己不能变成新的静默点。
+
+    ★ 返回 `None`（而不是空集）表示"读不到注册表"。调用方必须区分这两者：
+      空集会让"每个动作都不带 index"成立，于是**每条带文本的规则都报警** ——
+      假警报会训练人忽略这个检查。参照 `unrunnable_rule_actions` 的同款处理。
+
+    ⚠️ 依赖 `RegisteredAction.param_model` 这个属性名（未文档化）。
+       它变了的话 `tests/test_compat.py` 的哨兵应该先红 —— 见那里的断言。
+    """
+    registry = getattr(getattr(tools, "registry", None), "registry", None)
+    actions = getattr(registry, "actions", None)
+    if not actions:
+        return None
+    out: set[str] = set()
+    for name, action in actions.items():
+        param_model = getattr(action, "param_model", None)
+        if "index" in (getattr(param_model, "model_fields", None) or {}):
+            out.add(name)
+    return out
+
+
 def action_model_fields(agent_or_model: Any) -> set[str]:
     """动作模型上声明了哪些**动作名字段**。
 

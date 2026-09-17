@@ -92,10 +92,13 @@ guardrails:
 
   rules:
     # ── 一票否决：会改店铺真实数据 ──
+    #   ⚠️ match_action 里**没有** send_keys —— 它不针对任何元素，写在这里是死条目
+    #      （2026-09-17 查出来的，详见下面 allow-readonly-text 那段长注释）。
+    #      键盘动作由 block-destructive-keys 单独管。
     - id: block-destructive
       decision: block
       reason: "破坏性/不可逆操作，会改店铺真实数据"
-      match_action: [click, input, send_keys]
+      match_action: [click, input]
       match_element_text: "删除|批量删除|下架|清空|重置|退出登录|解绑|注销"
 
     # ── 一票否决：账号与会话 ──
@@ -129,17 +132,92 @@ guardrails:
       match_action: [click]
       match_element_text: "编辑|修改|保存"
 
-    # ── 显式放行：只读检索 ──
+    # ── 键盘动作：block 与 allow 各一条（都不带 match_element_text）──
+    #   ★★ 为什么键盘动作要单独处理，以及为什么这里**两条**：
+    #
+    #   `send_keys` 不针对任何元素（参数只有 keys），所以它**不在**下面
+    #   allow-readonly-text 的管辖范围内 —— 那条带 match_element_text，
+    #   对它永远不命中。这是 2026-09-17 查出的一类静默死条目
+    #   （见 runtime/runner.py:unreachable_text_rules）：
+    #   原先 block-destructive 里列着 send_keys，**看着像拦了，其实只到 confirm**。
+    #
+    #   ★ 但"一律 block 键盘"是错的：本任务的步骤里明确写着
+    #     "点击搜索或**按回车**" —— 那是只读检索，block 掉它会让任务做不下去。
+    #     所以拆成两条，靠**参数**区分（这是唯一可用的维度）：
+    #       · 带修饰键的组合（Control+o / Alt+… / Shift+Insert）→ block
+    #         （这类是"打开对话框再做事"的快捷方式，只读检索不需要任何一个）
+    #       · 单纯的功能键（Enter / Escape / PageDown …）→ allow
+    #
+    #   ⚠️ 已知边界，写在这里不藏：**回车是有歧义的**。
+    #     搜索框里按回车 = 只读检索；删除确认框里按回车 = 确认删除。
+    #     而我们拿不到元素上下文，**区分不了**。这里选择放行，理由是：
+    #     要弹出删除确认框，先得点那个删除按钮，而那个 click 会被
+    #     block-destructive 拦下 —— 所以"确认框"根本不该出现。
+    #     换句话说这个放行的安全性**依赖另一条规则先工作**，
+    #     它不是独立成立的。这一条要跟着 block-destructive 一起改。
+    - id: block-destructive-keys
+      decision: block
+      reason: "键盘快捷键（含修饰键组合）能打开对话框或直接提交，本任务只读，一律拦下"
+      match_action: [send_keys]
+      # 参数里出现 '+' 即视为修饰键组合。匹配的是 json.dumps 后的
+      # {"keys": "Control+o"} 这一形态（rules.py:141 的序列化方式）。
+      match_param_regex: '"keys"\s*:\s*"[^"]*\+'
+
+    - id: allow-readonly-keys
+      decision: allow
+      reason: "只读输入里的确认/翻页按键（搜索框按回车、PageDown 翻页）"
+      match_action: [send_keys]
+      match_url: "*mms.pinduoduo.com*"
+      # 只放行**没有修饰键**的功能键。刻意不含 Backspace/Delete（它们会改输入框内容，
+      # 而"改自己填的内容"和"改店铺数据"在告警上应区别对待）。
+      match_param_regex: '"keys"\s*:\s*"(?:Enter|Escape|Tab|PageDown|PageUp|Home|End|ArrowUp|ArrowDown|ArrowLeft|ArrowRight)"'
+
+    # ── 显式放行：只读检索（点击类，靠元素文本判定）──
     #   ★ 这条不是必需的（没它也会落到 default_decision），但它有独立价值：
     #     它把"哪些是明确允许的"写成了可审计的记录。
     #     没有 allow 规则时，事后无法区分"这个动作是被明确允许的"还是
     #     "当时没人想到要管它"。
-    - id: allow-readonly
+    #
+    #   ⚠️⚠️ match_action 里列的动作**必须**是"可能带元素文本"的那些，
+    #      否则那一条对它**永远不可能命中**（2026-09-17 发现并加了启动自检：
+    #      `runtime/runner.py:unreachable_text_rules`）。
+    #
+    #      成因是两个各自都正确的决定相乘：
+    #        1. 四个匹配维度是 AND，而 match_element_text 在拿不到元素文本时
+    #           判【不命中】（guardrails/rules.py:117-124 —— 刻意的：
+    #           把 None 当空串会让写错的规则拦死一切）；
+    #        2. 元素文本的唯一来源是**参数里的 `index`**
+    #           （guardrails/interceptor.py:_text_for 只读这一个键）。
+    #      → `extract` / `go_back` / `extract_table` / `navigate` / `send_keys`
+    #        这类不针对任何元素的动作，写在带 match_element_text 的规则里是**死条目**：
+    #        躺在 YAML 里、编译进 task_text、报告里显示"策略已加载"，一次都没生效过。
+    #        实际处置落到 default_decision=confirm。
+    #
+    #   ★ 处置方式不是"把它们删掉"，而是**按判据能不能用**把放行拆成两条：
+    #     能靠元素文本判的走这条，不能的走下面那条。这是 mock 模板早就用的形态，
+    #     也是 2026-09-17 那次真实运行逼出来的 —— Phase 3 的 books 真跑里，
+    #     这儿的旧写法让 `extract` 落到 confirm 并被 auto-deny 拒了，
+    #     也就是说**这条规则一次都没放行过它本该放行的东西**。
+    - id: allow-readonly-text
       decision: allow
-      reason: "只读检索类操作"
-      match_action: [input, click, scroll, extract, extract_table, go_back]
+      reason: "只读检索类操作（可判定元素文本的那些）"
+      match_action: [input, click, scroll, dropdown_options, select_dropdown]
       match_url: "*mms.pinduoduo.com*"
       match_element_text: "搜索|查询|筛选|确定|取消|下一页|上一页|关闭"
+
+    # ── 显式放行：不针对元素的只读动作 ──
+    #   ★★ 这一条**故意不写 match_element_text** —— 只有这样才能命中它们。
+    #     它不是"上面那条的补充"，判据完全不同：上面那条问"点的是不是安全控件"，
+    #     这条问"这个动作本身是不是只读的"。
+    - id: allow-readonly-noelement
+      decision: allow
+      reason: "不针对元素的只读动作：取数据、翻历史、翻页、找元素"
+      match_action: [extract, extract_table, go_back, scroll, find_elements, find_text]
+      match_url: "*mms.pinduoduo.com*"
+      # ⚠️ 刻意**不含** `evaluate`：它能执行任意 JS，性质上不是只读动作，
+      #    哪怕它常常被用来只读地取数据 —— "通常是只读的"和"是只读动作"不是一回事。
+      # ⚠️ 刻意**不含** `navigate`：导航的目标由 Layer 0 的域名白名单管，
+      #    不在这里再放行一次（两层各管各的，不要互相顶替）。
 
 agent:
   # ★ use_vision 必须为 False：DeepSeek 文本模型没有视觉能力。

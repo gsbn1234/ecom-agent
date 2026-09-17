@@ -19,11 +19,20 @@ PDD_URL = "https://mms.pinduoduo.com/goods/goods_list"
 
 @pytest.fixture
 def spec() -> GuardrailSpec:
-    """与 tasks/pdd_search_products.yaml 的 guardrails 段保持一致。
+    """规则集与 `tasks/pdd_search_products.yaml` 的 guardrails 段保持一致。
 
     ★ 这两处必须同步：YAML 改了而这里没改，测试就在验证一个不存在的策略。
-      落地时会有 test_dsl_loader 之类的测试从 YAML 直接编译出 spec 再跑这套矩阵，
-      但那个要等 DSL 层写完。此处的重复是过渡期的，且方向是安全的（宁严勿松）。
+      完整的真值表已经有一条打在**真 YAML** 上
+      （`test_runner_offline.py::test_pdd_template_decisions_after_the_fix`），
+      所以这里这份副本的职责只剩"测引擎本身"（最严优先、顺序无关、正则语义）。
+      但**判据**仍然必须同形 —— 否则引擎层的测试就与实际规则脱节了。
+
+    ⚠️ 2026-09-17 更新：pdd 模板把 `allow-readonly` 拆成了两条
+      （`allow-readonly-text` 带元素文本判据 / `allow-readonly-noelement` 不带），
+      并新增了 `block-destructive-keys` / `allow-readonly-keys`。
+      原因是一个静默死条目：带 `match_element_text` 的规则**永远匹配不上**
+      不针对元素的动作（`extract` / `go_back` / `extract_table` / `send_keys`）。
+      完整理由见 `tasks/pdd_search_products.yaml` 的长注释。
     """
     return GuardrailSpec(
         allowed_domains=["mms.pinduoduo.com", "*.pinduoduo.com"],
@@ -32,7 +41,7 @@ def spec() -> GuardrailSpec:
         rules=[
             GuardrailRule(
                 id="block-destructive",
-                match_action=["click", "input", "send_keys"],
+                match_action=["click", "input"],
                 match_element_text="删除|批量删除|下架|清空|重置|退出登录|解绑|注销",
                 decision=Decision.BLOCK,
                 reason="破坏性/不可逆操作，会改店铺真实数据",
@@ -59,12 +68,19 @@ def spec() -> GuardrailSpec:
                 reason="会真实创建或上线商品",
             ),
             GuardrailRule(
-                id="allow-readonly",
-                match_action=["input", "click", "scroll", "extract", "extract_table", "go_back"],
+                id="allow-readonly-text",
+                match_action=["input", "click", "scroll", "dropdown_options", "select_dropdown"],
                 match_url="*mms.pinduoduo.com*",
                 match_element_text="搜索|查询|筛选|确定|取消|下一页|上一页|关闭",
                 decision=Decision.ALLOW,
-                reason="只读检索类操作",
+                reason="只读检索类操作（可判定元素文本的那些）",
+            ),
+            GuardrailRule(
+                id="allow-readonly-noelement",
+                match_action=["extract", "extract_table", "go_back", "scroll", "find_elements", "find_text"],
+                match_url="*mms.pinduoduo.com*",
+                decision=Decision.ALLOW,
+                reason="不针对元素的只读动作：取数据、翻历史、翻页、找元素",
             ),
         ],
     )
@@ -93,7 +109,20 @@ def spec() -> GuardrailSpec:
         # 未命中任何规则 → default_decision
         ("click", "编辑", Decision.CONFIRM, "未命中 → 默认 confirm（不是 allow）"),
         ("click", "随便什么按钮", Decision.CONFIRM, "未知动作默认要人确认"),
-        ("scroll", None, Decision.CONFIRM, "scroll 无文本 → allow-readonly 不命中（它要求文本匹配）"),
+        # ── 不针对元素的动作：走 allow-readonly-noelement（不带文本判据的那条）──
+        #   ★ 这几行是 2026-09-17 那次修复的可执行证据。修复前它们全都是 CONFIRM ——
+        #     因为旧写法把 extract / go_back 塞进了**带** match_element_text 的规则里，
+        #     而那条规则对无元素动作**永不命中**。
+        #     ⚠️ 注意"永不命中"的后果是落到 default_decision，**不是**被拦死：
+        #     一个是"没人管"，一个是"要人点批准"，在报告里长得完全不同。
+        ("extract", None, Decision.ALLOW, "取数据是只读动作，不需要元素文本判据"),
+        ("extract_table", None, Decision.ALLOW, "同上：它的参数是 table_index/max_rows"),
+        ("go_back", None, Decision.ALLOW, "回历史是只读的"),
+        ("scroll", None, Decision.ALLOW, "不带 index 的滚动 → 落到无元素动作那条放行规则"),
+        # ── 对照：刻意**不**放行的两个 ──
+        #   没有这两行的话，一个"凡无元素动作一律放行"的实现也能让上面全绿。
+        ("evaluate", None, Decision.CONFIRM, "★ 能执行任意 JS —— 不是只读动作"),
+        ("navigate", None, Decision.CONFIRM, "★ 导航归 Layer 0 白名单管，这里不重复放行"),
     ],
 )
 def test_decision_matrix(spec, action, element_text, expected, why):
@@ -118,11 +147,12 @@ def test_default_decision_is_confirm_not_allow(spec):
 def test_most_severe_wins_when_multiple_rules_match(spec):
     """allow 和 block 同时命中时，判 block。
 
-    构造："删除并搜索" 同时匹配 block-destructive（删除）和 allow-readonly（搜索）。
+    构造："删除并搜索" 同时匹配 block-destructive（删除）和
+    allow-readonly-text（搜索）。
     """
     r = GuardrailPolicy(spec).evaluate("click", {}, PDD_URL, "删除并搜索")
     assert "block-destructive" in r.matched_rule_ids, "前提：两个规则都该命中"
-    assert "allow-readonly" in r.matched_rule_ids, "前提：两个规则都该命中"
+    assert "allow-readonly-text" in r.matched_rule_ids, "前提：两个规则都该命中"
     assert r.decision is Decision.BLOCK
     assert r.rule_id == "block-destructive"
 

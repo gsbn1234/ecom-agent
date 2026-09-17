@@ -29,7 +29,7 @@ from typing import Any, Iterable
 from pydantic import ValidationError
 
 from ecom_agent import compat
-from ecom_agent.actions.guard_gate import build_tools
+from ecom_agent.actions import build_tools, verify_extract_table_round_trip
 from ecom_agent.config import DB_PATH, LIVE_LLM, RUNS_DIR
 from ecom_agent.dsl.compiler import CompiledTask
 from ecom_agent.guardrails.interceptor import GuardrailInterceptor
@@ -153,6 +153,53 @@ def unrunnable_rule_actions(compiled: CompiledTask, tools: Any) -> list[tuple[st
     for rule in compiled.spec.guardrails.rules:
         for name in rule.match_action or ():
             if name not in registered:
+                out.append((rule.id, name))
+    return out
+
+
+def unreachable_text_rules(
+    compiled: CompiledTask, tools: Any
+) -> list[tuple[str, str]]:
+    """找出「写了 `match_element_text`，却把不可能带元素文本的动作也列进 `match_action`」
+    的条目，返回 `[(rule_id, action_name)]`。
+
+    ★★ 这是 `unrunnable_rule_actions` 的**另一半**，两者合起来才覆盖
+      "规则永远不会命中"的全部成因：
+
+        · `unrunnable_rule_actions`：动作名**根本不存在**（拼错 / 还没实现）
+        · 本函数：动作名存在，但**这个维度对它不适用**
+
+      第二条更隐蔽：YAML 读起来完全正常，动作名也是真的，
+      review 的人没有任何理由怀疑它。它的成因是两个都正确的决定相乘：
+
+        1. `match_element_text` 拿不到文本时判【不命中】（rules.py:117-124，
+           刻意如此 —— 把 None 当空串会让写错的规则拦死一切）
+        2. `_text_for` 只从参数里的 `index` 取值（interceptor.py:517-526）
+
+      → 任何"不针对元素"的动作（`extract` / `go_back` / `extract_table` / `navigate` …）
+        在这些规则里**永远不可能命中**。
+
+    ★ 实测到的后果不是"少拦了危险动作"（那方向反而安全），而是
+      **模板声称的意图 ≠ 实际策略**：三份模板里都写着
+      "只读检索类操作 → allow"，而 `extract` 实际落到了 `default_decision=confirm`。
+      一个说 allow 实际是 confirm 的规则，比没写这条规则更坏：
+      读 YAML 的人会以为只读动作已经放行了。
+
+    ★ 只警告不报错（同 `unrunnable_rule_actions`）：方向是 fail-closed，
+      不该让 run 起不来。但必须打出来 —— 否则只有把两个文件对着读才发现。
+    """
+    bearing = compat.index_bearing_actions(tools)
+    if bearing is None:
+        return []
+    out: list[tuple[str, str]] = []
+    for rule in compiled.spec.guardrails.rules:
+        if not rule.match_element_text:
+            # ★ 没写 match_element_text 的规则不受影响 —— 它不靠元素文本判定，
+            #   在 extract 这类动作上是**能**命中的（mock 模板就靠这个正确处理了
+            #   extract_table）。这个分支是"不要误报"的关键。
+            continue
+        for name in rule.match_action or ():
+            if name not in bearing:
                 out.append((rule.id, name))
     return out
 
@@ -333,12 +380,39 @@ class TaskRunner:
         llm = self._resolve_llm()
         tools = build_tools()
 
+        # ★ 启动自检：**真的按库的方式调一次** extract_table，接线不通就当场死。
+        #   放在这里而不是测试里，理由与 interceptor 的停机回调自检相同 ——
+        #   这类接线错误的报错【指不到原因】，症状是"LLM 调了但没反应"。
+        #   宁可 run 起不来，也不要一个"动作看起来注册了、实际调不动"的 run。
+        #   （不需要浏览器：门禁用桩会话调，见 extract_table.py 的说明。）
+        #   ⚠️ 必须 await：这个门禁内部要真的 await 一次动作函数，而
+        #      `run()` 本身就是协程 —— 早先写成同步调用（内部 asyncio.run）
+        #      时，它在【唯一的生产路径上】一次都没跑成过。细节见
+        #      extract_table.py 里 verify_extract_table_round_trip 的说明。
+        await verify_extract_table_round_trip(tools)
+
         for rule_id, action_name in unrunnable_rule_actions(self.compiled, tools):
             logger.warning(
                 "护栏规则 %s 引用了未注册的动作 %r —— 这条规则永远不会命中。"
                 "（拼错了？还是那个自定义 action 还没实现？）",
                 rule_id,
                 action_name,
+            )
+
+        # ★ 启动自检的另一半：动作名存在、但**这个维度对它不适用**。
+        #   比上一条隐蔽得多 —— YAML 读起来完全正常，动作名也是真的。
+        #   后果是"模板声称的意图 ≠ 实际策略"（比如写着 allow 实际是 confirm）。
+        for rule_id, action_name in unreachable_text_rules(self.compiled, tools):
+            logger.warning(
+                "护栏规则 %s 既写了 match_element_text、又把动作 %r 列进了 match_action，"
+                "但 %r 不针对任何元素（参数里没有 index）—— 这一条对它永远不会命中，"
+                "实际处置会落到 default_decision=%s。"
+                "（要放行这类只读动作，得像 tasks/mock_shop_readonly.yaml 那样"
+                "单开一条不带 match_element_text 的规则）",
+                rule_id,
+                action_name,
+                action_name,
+                self.compiled.spec.guardrails.default_decision.value,
             )
 
         # ★ 记录器是**整个 run 一个**，不是每个 attempt 一个。

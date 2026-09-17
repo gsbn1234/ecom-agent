@@ -75,12 +75,28 @@ guardrails:
   max_consecutive_blocks: 3
 
   rules:
-    - id: allow-readonly
+    # ⚠️ match_action 里列的动作必须是"可能带元素文本"的那些（参数里有 `index`），
+    #    否则那一条对它**永远不可能命中** —— 原因见 tasks/pdd_search_products.yaml
+    #    同处的长注释（两个各自都正确的决定相乘，产物是一个静默的死条目）。
+    #    启动自检：runtime/runner.py 的 `unreachable_text_rules`。
+    #
+    #    ★ 所以放行也拆成两条：能靠元素文本判的 / 不能的。
+    #      Phase 3 的真跑就是被旧写法咬到的：那会儿 `extract` 落在旧 allow-readonly 里，
+    #      而它对 extract 永不命中 → 落到 confirm → 被 auto-deny 拒掉，
+    #      于是"只读采集"任务连一次采集都做不成。
+    - id: allow-readonly-text
       decision: allow
-      reason: "只读检索类操作"
-      match_action: [input, click, scroll, extract, extract_table, go_back]
+      reason: "只读检索类操作（可判定元素文本的那些）"
+      match_action: [input, click, scroll, dropdown_options, select_dropdown]
       match_url: "*books.toscrape.com*"
       match_element_text: "next|Next"
+
+    - id: allow-readonly-noelement
+      decision: allow
+      reason: "不针对元素的只读动作：取数据、翻历史、翻页、找元素"
+      match_action: [extract, extract_table, go_back, scroll, find_elements, find_text]
+      match_url: "*books.toscrape.com*"
+      # 同 pdd 模板：刻意不含 evaluate（任意 JS）与 navigate（归 Layer 0 白名单）。
 
     - id: block-destructive
       decision: block

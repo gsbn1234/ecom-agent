@@ -30,6 +30,7 @@ from ecom_agent.dsl.compiler import compile_task
 from ecom_agent.dsl.loader import load_task
 from ecom_agent.guardrails.interceptor import GuardrailInterceptor
 from ecom_agent.guardrails.policy import GuardrailPolicy
+from ecom_agent.guardrails.rules import GuardrailRule
 from ecom_agent.observability.models import LlmUsage, RunRecord
 from ecom_agent.observability.recorder import RunRecorder
 from ecom_agent.runtime import runner as R
@@ -81,7 +82,7 @@ def _tools():
       那个 ScrollActionModel"是两条不同的类，校验会报一条完全指不到原因的错。
     """
     if not _TOOLS_CACHE:
-        from ecom_agent.actions.guard_gate import build_tools
+        from ecom_agent.actions import build_tools
 
         _TOOLS_CACHE.append(build_tools())
     return _TOOLS_CACHE[0]
@@ -218,20 +219,57 @@ def test_preflight_runs_before_browser_and_before_artifacts(books, tmp_path, mon
     assert not runs_dir.exists(), "预检失败却留下了产物目录"
 
 
-def test_unrunnable_rule_actions_flags_unregistered_actions(books, pdd):
+def test_unrunnable_rule_actions_flags_unregistered_actions(books):
     """★ 规则里引用了未注册的动作 → 那条规则**永远不会命中**，必须在启动时说出来。
 
-    ⚠️ 这条断言绑在一个**已知的真实状态**上：两个 YAML 的 allow-readonly 规则
-      都写了 `extract_table`，而它不是 browser-use 的内置动作（内置 24 个里没有），
-      我们自己的实现要等 Phase 4。所以现在它必须被标出来。
+    ★★ 这条测试的断言在 Phase 4 **被有意翻转过一次**，经过值得留着：
 
-      Phase 4 注册了 extract_table 之后这条会红 —— 那时**改测试**就是对的，
-      因为"这条规则是摆设"这个事实消失了。★ 这正是想要的：它逼着人去面对
-      "规则集和注册表对不对得上"，而不是让这个错位一直躺着。
+      原先它断言的是 `("allow-readonly", "extract_table") in ...`，绑在一个
+      **当时的真实状态**上：两个 YAML 的 allow-readonly 都写了 `extract_table`，
+      而它当时还不是已注册动作，所以那条规则是**摆设**。
+      当时的注释里写明了"Phase 4 注册之后这条会红，那时改测试就是对的"。
+
+      Phase 4 到了，它确实红了，而且红的形式正是预言的那种：
+      `unrunnable_rule_actions` 返回 `[]`（见
+      `test_real_task_yamls_have_no_unrunnable_rules`）。于是把它改成
+      **构造一个真的错位**来测检测能力本身 —— 否则翻转之后，
+      "能检测出错位"这件事就没人测了，而那是这个检查的全部价值。
+
+    ★ 为什么用"合成本"而不是"留着一条 YAML 不修"来保持覆盖：
+      留着不修等于让项目里长期躺着一个已知的静默失效，
+      只为了让一条测试有东西可测 —— 那是拿产品换测试。
+      合成一个只活在测试里的错位，覆盖一样，代价为零。
     """
-    tools = _tools()
-    assert ("allow-readonly", "extract_table") in R.unrunnable_rule_actions(books, tools)
-    assert ("allow-readonly", "extract_table") in R.unrunnable_rule_actions(pdd, tools)
+    spec = books.spec.model_copy(deep=True)
+    spec.guardrails.rules.append(
+        GuardrailRule(
+            id="synthetic-typo",
+            decision="allow",
+            match_action=["extract_tabel"],  # ★ 真实存在的错法：把 table 拼成 tabel
+            reason="合成的：这条规则引用了一个永远不存在的动作名",
+        )
+    )
+    compiled = compile_task(spec)
+
+    flagged = R.unrunnable_rule_actions(compiled, _tools())
+    assert ("synthetic-typo", "extract_tabel") in flagged
+
+    # ★ 对照：同一个函数对**修好之后**的真实 YAML 一条都不该报。
+    #   没有这一半的话，一个"永远返回所有 match_action"的实现也能让上面通过 ——
+    #   而那种实现等于每次启动刷一屏假警告，很快就会没人看它。
+    assert R.unrunnable_rule_actions(books, _tools()) == []
+
+
+def test_real_task_yamls_have_no_unrunnable_rules(books, pdd):
+    """★★ Phase 4 的收尾事实：仓库里两个 YAML 的规则集与注册表**完全对得上**了。
+
+      这条单独存在（而不是并进上一条）是因为它是一句**关于仓库状态**的断言，
+      不是关于某个函数的断言：它会在有人往 YAML 里写一个还没实现的动作名时变红。
+      而"护栏规则是摆设"这件事，只有把 YAML 和注册表对着读才发现 ——
+      所以必须有一处替人对着读。
+    """
+    assert R.unrunnable_rule_actions(books, _tools()) == []
+    assert R.unrunnable_rule_actions(pdd, _tools()) == []
 
 
 def test_unrunnable_rule_actions_passes_for_the_real_registry(books):
@@ -254,6 +292,149 @@ def test_unrunnable_rule_actions_silent_when_registry_unreadable(books):
       就跟着一起被忽略了。（同 compat.action_model_fields 的教训。）
     """
     assert R.unrunnable_rule_actions(books, tools=object()) == []
+
+
+# ── A2. 「动作名存在、但这个维度对它不适用」 ────────────────
+#   这是上面那个检查的另一半。**两者合起来才覆盖"规则永远不会命中"的全部成因**，
+#   而这一半隐蔽得多：YAML 读起来完全正常，动作名也是真的。
+def test_unreachable_text_rules_flags_elementless_actions(books):
+    """★★ 规则写了 match_element_text、又把 `extract`/`go_back` 列进 match_action
+      → 对这两个动作**永远不会命中**。
+
+    ★ 为什么这是真问题而不只是洁癖：它的后果不是"少拦了危险动作"
+      （那方向反而安全），而是**模板声称的意图 ≠ 实际策略**。
+      旧版 `books_demo.yaml` 的 allow-readonly 写着"只读检索类操作 → allow"，
+      而 `extract` 实际落到 `default_decision=confirm` —— 而且 Phase 3 的真跑里
+      它**真的被 auto-deny 拒了**，只读采集任务连一次采集都没做成。
+
+    ★★ 断言用的是**合成的规则集**，不是真实模板 —— 这一处是**有意翻转过一次**的，
+      经过值得留着（同 `test_unrunnable_rule_actions_flags_unregistered_actions`）：
+
+        这条测试原先对着真实的 `books` 断言 `("allow-readonly", "extract") in ...`，
+        也就是说它绑在一个"当时确实存在"的缺陷上。缺陷修好之后它红了 ——
+        那是**对的**，但直接删掉它就没人测"检测能力"本身了，
+        而那是这个检查的全部价值。于是改成合成一个只活在测试里的死条目：
+        覆盖一样，代价为零，且不会为了养一条测试而在仓库里留一个真缺陷。
+
+    ★ 反面的对照（同一函数、同一次调用里取）：
+      `click` / `input` 带 `index`，**不该**被报 —— 没有这一半的话，
+      一个"把 match_action 全报一遍"的实现也能让上面通过，
+      而那种实现等于每次启动刷一屏假警告。
+    """
+    spec = books.spec.model_copy(deep=True)
+    spec.guardrails.rules.append(
+        GuardrailRule(
+            id="synthetic-elementless",
+            decision="allow",
+            match_action=["extract", "go_back"],
+            match_url="*books.toscrape.com*",
+            match_element_text="next|Next",  # ← 就是这一行让它永不命中
+            reason="合成的：动作不针对元素，却写了元素文本判据",
+        )
+    )
+    flagged = R.unreachable_text_rules(compile_task(spec), _tools())
+    pairs = set(flagged)
+
+    assert ("synthetic-elementless", "extract") in pairs, f"extract 不针对元素，该被报出来：{flagged}"
+    assert ("synthetic-elementless", "go_back") in pairs, f"go_back 不针对元素，该被报出来：{flagged}"
+    assert ("synthetic-elementless", "click") not in {a for _, a in flagged}, (
+        f"click 是带 index 的，不该被报 —— 这是「不要误报」的那一半"
+    )
+
+    # ★ 对照：同一函数对**修好之后的真实模板**一条都不该报。
+    #   没有这一半，一个"永远返回全部 match_action"的实现也能让上面通过。
+    assert R.unreachable_text_rules(books, _tools()) == []
+
+
+def test_unreachable_text_rules_gives_up_when_it_cannot_know(books):
+    """★ 读不到注册表 → 返回空，而不是"每条带文本的规则都报警"。
+
+      拿不到注册表时空集会让"没有任何动作带 index"成立，
+      于是**每条带 match_element_text 的规则都报警** —— 一屏假警报。
+      与 `unrunnable_rule_actions` 同款处理，也必须同款被测。
+    """
+    assert R.unreachable_text_rules(books, tools=object()) == []
+
+
+def test_a_rule_without_element_text_is_never_flagged(books):
+    """★★ 没写 match_element_text 的规则**不受影响** —— 它在 extract 上是能命中的。
+
+      这是"不要误报"的关键分支，也是**修法本身**的证据：
+      `tasks/mock_shop_readonly.yaml` 正是靠"单开一条不带 match_element_text 的
+      规则"正确处理了 extract_table。没有这条测试的话，一个
+      "只要 match_action 里有 extract 就报警"的实现也能让上面那条通过。
+    """
+    spec = books.spec.model_copy(deep=True)
+    spec.guardrails.rules.append(
+        GuardrailRule(
+            id="synthetic-no-element-text",
+            decision="allow",
+            match_action=["extract", "extract_table", "go_back"],
+            match_url="*books.toscrape.com*",
+            reason="合成的：正确形态 —— 不写 match_element_text，于是这些动作真能命中",
+        )
+    )
+    flagged = R.unreachable_text_rules(compile_task(spec), _tools())
+    assert "synthetic-no-element-text" not in {r for r, _ in flagged}, (
+        f"不带 match_element_text 的规则被误报了：{flagged}"
+    )
+
+
+# ── A3. 三份真实模板：修完之后一条都不该剩 ──────────────────
+def test_all_real_task_yamls_now_have_zero_unreachable_rule_entries(pdd, books):
+    """★★★ 2026-09-17 的修复本身的回归测试 —— 断言的是**仓库状态**，不是某个函数。
+
+      修复前实测（`block-destructive`/`allow-readonly` 里的死条目）：
+
+          pdd_search_products.yaml : 3 条
+          books_demo.yaml          : 2 条
+          mock_shop_readonly.yaml  : 0 条
+
+      ★ 为什么这条必须存在：这次修法**不是**"删掉几个词"，而是把放行拆成
+        "能靠元素文本判的"和"不能的"两条规则。拆错了（比如新规则又带上了
+        match_element_text）症状和修复前一模一样：**完全静默**。
+        所以"修好了"这件事必须由一条断言盯着，而不是靠这次读过一遍。
+    """
+    for compiled in (pdd, books):
+        flagged = R.unreachable_text_rules(compiled, _tools())
+        assert flagged == [], (
+            f"{compiled.spec.id} 里仍有永远不会命中的规则条目：{flagged}。\n"
+            f"  改法是按判据把放行拆成两条：带 match_element_text 的只管点击类，"
+            f"不带的那条才管 extract / go_back / extract_table 这类无元素动作。"
+        )
+
+
+@pytest.mark.parametrize(
+    ("action", "params", "element_text", "expected", "why"),
+    [
+        ("click", {}, "搜索", "allow", "有点击目标、文本是安全控件 → 放行"),
+        ("extract", {}, None, "allow", "★ 这条就是被旧写法静默吃掉的那个"),
+        ("go_back", {}, None, "allow", "回历史是只读的"),
+        ("scroll", {}, None, "allow", "不带 index 的滚动也是只读的（旧写法里落在死条目上）"),
+        ("send_keys", {"keys": "Enter"}, None, "allow", "搜索框回车 —— 任务步骤里明确要用的"),
+        ("send_keys", {"keys": "Control+o"}, None, "block", "★ 修饰键组合：旧写法里这条【看着像拦了，其实只到 confirm】"),
+        ("evaluate", {}, None, "confirm", "★ 刻意不放行：它能执行任意 JS，不是只读动作"),
+    ],
+)
+def test_pdd_template_decisions_after_the_fix(pdd, action, params, element_text, expected, why):
+    """★★★ 对着**真实的 YAML**跑决策，不是对着测试里复制的规则集。
+
+      ★ 为什么必须用真模板：`test_guardrail_policy.py` 里的规则集是**手抄的副本**
+        （它自己的 docstring 里就写着"两处必须同步"，而那种同步靠自觉）。
+        这次发现问题的现场恰恰是"副本与 YAML 都对、而两者与**行为**不一致"，
+        所以修复的验收不能再用一份副本 —— 必须打真 YAML。
+
+      ★ 每行断言都带一个 `why`，因为它同时是文档：想知道"这条模板下某个动作
+        会被怎么处置"，读这张表比读 YAML 快。
+    """
+    from ecom_agent.guardrails.policy import GuardrailPolicy
+
+    policy = GuardrailPolicy(pdd.spec.guardrails)
+    verdict = policy.evaluate(action, params, pdd.spec.start_url, element_text)
+    assert verdict.decision.value == expected, (
+        f"{action} {params or ''}（元素文本={element_text!r}）期望 {expected}，"
+        f"实际 {verdict.decision.value}（规则={verdict.rule_id}）—— {why}"
+    )
 
 
 # ── B. 状态判定与重试 ─────────────────────────────────────

@@ -109,6 +109,49 @@ def test_action_decorator_signature():
         assert name in params, f"Registry.action 不再接受 {name}"
 
 
+def test_registered_action_exposes_param_model_and_the_index_dimension():
+    """★★ 哨兵：`index_bearing_actions` 依赖两件未文档化的事，缺一就会**静默**退化。
+
+      · `RegisteredAction.param_model` —— 这个属性名是我们反射用的入口，
+        它没了的话 `compat.index_bearing_actions` 会返回空集，
+        于是 `unreachable_text_rules` **一条都报不出来** —— 检查变成摆设，
+        而它恰恰是防"规则是摆设"的。**防静默的东西自己静默失效**是本项目
+        反复吃到的形状，所以它必须有自己的哨兵。
+      · 各个动作的参数模型里，`index` 是不是「可能带元素文本」的标志。
+        元素文本的唯一来源就是参数里的 `index`
+        （`guardrails/interceptor.py:_text_for` 只读这一个键）。
+
+    ★ 这里断言的是**两端的形状**，不是"某个动作带不带 index"的具体答案：
+      后者是库的业务内容（会随版本变），前者才是我们的契约。
+      但也不能只断言"属性存在" —— 那太松，属性存在而字段名变了照样静默失效。
+      所以三个方向一起：
+        1. 入口属性在；
+        2. `index-bearing` 与 `index-less` **两类都非空**（否则"判据"就没有分辨力，
+           和"永远返回同一个答案"的假实现无法区分）；
+        3. 至少有一个动作是我们知道的"确实针对元素"的（`click`）。
+    """
+    from browser_use.tools.service import Tools
+
+    from ecom_agent import compat
+
+    bearing = compat.index_bearing_actions(Tools())
+    assert bearing is not None, "拿不到注册表 —— index_bearing_actions 的入口变了"
+
+    assert "click" in bearing, (
+        f"`click` 的参数模型里没有 index 了 —— 元素文本的来源变了，"
+        f"unreachable_text_rules 的判据要跟着重写。实测 bearing={sorted(bearing)}"
+    )
+
+    # ★ 2：两类都非空。只断一个方向的话，一个"凡动作都带 index"的实现（= 永不报警）
+    #   和一个"凡动作都不带"的实现（= 每条规则都报警）都能蒙混过去，
+    #   而这两种都是静默失效。
+    all_actions = set(Tools().registry.registry.actions)
+    assert all_actions - bearing, (
+        f"没有任何动作是 index-less 的？那这个判据就没有分辨力了。"
+        f"实测 bearing={sorted(bearing)}"
+    )
+
+
 def test_special_param_names_are_reserved():
     """★★ 本文件最重要的一条：这 9 个名字是【保留字】，自定义 action 不能用。
 
@@ -174,6 +217,46 @@ def test_agent_swallows_unknown_kwargs():
     src = inspect.getsource(Agent.__init__)
     assert "kwargs[" not in src and "kwargs.get" not in src, (
         "Agent.__init__ 开始读 kwargs 了 —— context 相关的结论需要重新验证"
+    )
+
+
+def test_special_params_are_injected_at_the_call_site():
+    """★ 自定义 action 能拿到 `browser_session`，靠的是**调用点**的注入。
+
+    本项目的 `extract_table` 需要访问当前页面，而它拿不到"传给 Agent 的那个对象"
+    （`Agent.__init__` 会把不认识的 kwargs 直接丢弃，见 test_agent_swallows_unknown_kwargs）。
+    它唯一的来源是库**注入** —— 而这件事是未文档化的：
+
+        registry/service.py:368-375   special_context = {'browser_session': browser_session, ...}
+        registry/service.py:395       action.function(params=validated_params, **special_context)
+
+    这两行同时是三个契约，缺一不可，所以三条都断言下来：
+      1. `browser_session` 在注入字典里（不在 → 我们的 action 永远拿不到会话）；
+      2. 调用形状是 `params=` **整包** + `**special_context`（不是把参数展开）——
+         这决定了自定义 action 的签名必须写成 `(params: XxxAction, browser_session: ...)`；
+      3. `_normalize_action_function_signature` 里那次 `param_type == expected_type`
+         是**运行时比较**，所以 `from __future__ import annotations` 会让它恒为 False
+         （注解变成 str）—— 报错却是两边长得一模一样的
+         "conflicts with special argument injected by tools"。
+         完整对照实验在 tests/test_extract_table.py。
+
+    ★ 用源码断言而不是"跑一次看看"：这里要守的是**契约的形状**，
+      而"跑一次"只能证明今天能跑 —— 库明天把 `params=` 改成展开，
+      我们的 action 会在运行时静默收不到参数，而这条测试会立刻红。
+    """
+    import browser_use.tools.registry.service as rsvc
+
+    src = inspect.getsource(rsvc)
+    assert "'browser_session': browser_session," in src, (
+        "库不再把 browser_session 放进 special_context —— extract_table 拿不到页面了"
+    )
+    assert "action.function(params=validated_params, **special_context)" in src, (
+        "库调用 action 的形状变了（params= 整包 + 特殊参数展开）—— "
+        "自定义 action 的签名契约需要重新核对，见 ecom_agent/actions/extract_table.py 顶部"
+    )
+    assert "conflicts with special argument injected by tools" in src, (
+        "库不再做注解类型比较了 —— 那条 'from __future__ import annotations 会炸' "
+        "的结论需要重新验证（tests/test_extract_table.py 的对照实验）"
     )
 
 
