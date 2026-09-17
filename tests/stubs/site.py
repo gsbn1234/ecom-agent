@@ -91,6 +91,40 @@ _PAGES: dict[str, str] = {
 <div role="button" tabindex="0"><span>嵌套在span里的下架</span></div>
 <a href="/page2">第二页</a>
 </body></html>""",
+    # ★★ 卡片网格页 —— `extract_cards` 的对象。页面里两处细节是**判据的一部分**，
+    #    不是排版随意，改页面等于改判据：
+    #
+    #    1) **6 个 `<script>` 故意比商品卡（4 张）还多**。没有 SKIP 过滤时，
+    #       "成员最多的重复块"就是这 6 个脚本 —— S8 探路在真站点上撞到的正是这个形态
+    #       （30 个行内埋点脚本当上了最大的重复块，见 actions/extract_cards.py 顶部）。
+    #       于是"选中的组是 DIV 而不是 SCRIPT"这条断言**只在过滤真的生效时成立**，
+    #       它不是一个顺手加的断言，它就是那次教训的钉子。
+    #       `type="text/plain"` 让它们不执行：内容是惰性的，但 tagName 仍是 SCRIPT，
+    #       所以"要不要跳过它"这个判定完全不受影响。
+    #    2) **每个字段各占一个块级 `<div>`** → innerText 天然是"一行一个字段"。
+    #       这不是为了好看：`extract_cards` 的字段判据就是**按行**匹配的，
+    #       而"innerText 到底怎么分行"恰恰是离线单测碰不到的那一层
+    #       （假 page 只会把我喂进去的行原样吐回来）。
+    #       ⚠️ 四个字段各给一个**不同的 class**，这也是判据的一部分：
+    #       若四个都一样，每张卡内部自己就成了一个"4 个同形兄弟"的组，
+    #       于是"第 0 组"要靠文档顺序去和商品卡抢 —— 判据会变得依赖巧合。
+    "/cards": """<!doctype html><html data-mock-version="1"><head><meta charset="utf-8">
+<title>机会商品</title></head><body>
+<h1>机会商品</h1>
+<div><a href="/">首页</a><a href="/cards">机会商品</a><a href="/page2">第二页</a></div>
+<div>
+<div class="card"><div class="t">测试商品甲</div><div class="p">¥12.30</div><div class="h">热度 88</div><button>发布同款</button></div>
+<div class="card"><div class="t">测试商品乙</div><div class="p">¥8.80</div><div class="h">热度 12</div><button>发布同款</button></div>
+<div class="card"><div class="t">测试商品丙</div><div class="p">¥105.00</div><div class="h">热度 7</div><button>发布同款</button></div>
+<div class="card"><div class="t">测试商品丁</div><div class="p">¥3.50</div><div class="h">热度 201</div><button>发布同款</button></div>
+</div>
+<script type="text/plain">埋点一</script>
+<script type="text/plain">埋点二</script>
+<script type="text/plain">埋点三</script>
+<script type="text/plain">埋点四</script>
+<script type="text/plain">埋点五</script>
+<script type="text/plain">埋点六</script>
+</body></html>""",
 }
 
 # ★ 历史别名：devtools/spike_s2_element_text.py 访问的是 /s2。
@@ -163,6 +197,15 @@ class Site:
     @property
     def allowed(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def cards(self) -> str:
+        """卡片网格页（`extract_cards` 的对象）—— 页面结构见 `_PAGES` 里的长说明。
+
+        ★ 做成属性而不是让测试自己拼 `allowed + "/cards"`：路径写错时报的是
+          "导航失败"，而那个报错指向网络/浏览器，排查方向全错（S7 那条教训的同一形态）。
+        """
+        return f"{self.allowed}/cards"
 
     @property
     def forbidden(self) -> str:
