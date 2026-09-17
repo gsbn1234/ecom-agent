@@ -6,6 +6,12 @@
     · `Redactor` **整个类**在 `tests/` 下零命中（两条独立检查：没有任何用例断言过
       `<REDACTED>` 产物、没有任何用例 import 过它）—— 缺的不只是那三个名字；
     · `Authorization: Bearer <token>` 这个**最常见的凭证形态**不在脱敏规则的射程内。
+      ✅ **2026-09-17 已修**（`redact.py` 加了一条锚在头名上的规则）。当时先钉的是
+      `strict xfail`，修完它变成 XPASS 主动失败提醒删标记 —— 这个流程本身跑通了。
+      ⚠️ 注意"已修"的射程：**只覆盖头部形态**。`Authorization: Basic <base64>` 和
+      DRF 的 `Authorization: Token <key>` 是同一族缺口的另外两个实例，**都还是漏的** ——
+      ⚠️ **本文件里没有它们的守卫**（故意没顺手加，是射程决定），别以为在这测过了；
+      现状记在 README 缺口第 2 条与 `docs/guardrail_design.md` 的「落盘脱敏的失效边界」一节。
 
 ★ 这里测不到什么，先说清楚（与 `test_extract_cards.py` 同一条纪律）：
   这些 flag **报得对不对**，单测判不了 —— 它只判「哪个字符串在什么条件下出现、
@@ -421,33 +427,73 @@ def test_the_redaction_counts_column_comes_from_the_record_not_from_the_redactor
     assert json.loads(run_row2["redaction_counts_json"]) == {"literal": 2}
 
 
-# ── 一处**已知缺口**：最常见的凭证形态盖不住 ────────────────
-@pytest.mark.xfail(
-    strict=True,
-    reason="redact.py 的 token 规则要求冒号在关键字之后，而真实头部是 'Authorization: Bearer <tok>'",
-)
+# ── 授权头的规范形态：这条以前是已知缺口，2026-09-17 修好了 ──────
 def test_a_bearer_token_in_an_authorization_header_is_redacted():
-    """★★★ 已知缺口，**故意让它红着**（`strict=True`）—— 修好后这条会变成 XPASS
-    并主动失败，提醒改的人把标记删掉。
+    """★ 这条**以前是 `strict xfail`** —— 「已知缺口的机器可读记录」，
+    **不等于"这条已经测过了"**。2026-09-17 修好 `redact.py` 之后它转正，
+    现在是一条真的守卫。（修的时候它先变成 XPASS 主动失败，这才对。）
 
-    实测（2026-09-17，真跑）：
+    修之前实测（真跑）：
 
         "Authorization: Bearer abc123def456ghi789xyz"
-          → _detect_pii = []          ← 一个字都没盖住
+          → 一个字都没盖住
         "bearer=abc123def456ghi789xyz"
-          → _detect_pii = ['token']   ← 反而这个少见形态认得出
+          → 反而这个少见形态认得出
 
-    机制：`redact.py:59` 的规则是
-    `\\b(?:bearer|token|api[_-]?key|...)\\b\\s*[:=]\\s*...` —— `[:=]` 必须在
-    **关键字之后**。而真实的 `Authorization: Bearer <token>` 头部里，冒号在
-    `Bearer` **之前**，所以那个 `bearer` 分支对它的规范形态**永远不命中**。
-
-    这正是该模块 docstring 自己警告过的失效（"最危险的地方在于它看起来在工作"）：
-    `token:` / `api_key=` 这些形态是好的，于是"凭证类规则在工作"看起来成立。
-
-    修法（**属于生产代码改动，需单独拍板，不顺手做**）：把关键字分支拆开，
-    给 `bearer <值>` 这种"关键字 + 空白 + 值"的形态单独一条规则。
+    机制：老规则要求 `[:=]` 出现在关键字**之后**，而规范头部里冒号在
+    `Bearer` **之前** —— 那个 `bearer` 分支对它的规范形态永远不命中。
+    这正是该模块 docstring 警告过的失效（"最危险的地方在于它看起来在工作"）：
+    `token:` / `api_key=` 是好的，于是"凭证类规则在工作"看起来成立。
     """
     secret = "abc123def456ghi789xyz"
     text = f"Authorization: Bearer {secret}"
-    assert Redactor().text(text) != text
+    assert secret in text  # ★ 先证明输入确实含真值，否则下面那条断言会白过
+    assert Redactor().text(text) == "Authorization: Bearer <REDACTED:token>"
+
+
+def test_the_bearer_rule_does_not_fire_on_prose():
+    """★ 对照实验：**这条输入就是「笼统的 bearer + 空白 + 值」会误伤的那一个。**
+
+    把规则改回不锚头名的写法（`\\bbearer\\s+(值)`）→ 这条必红：
+    `authentication` 有 14 个字符、又全在字符类里，会被当成凭证盖掉
+    （实测产物：`error: Bearer <REDACTED:token> is required`）。
+
+    所以这条钉住的**不是**"能盖住"，是"**没盖过头**"——
+    脱敏的第一个失败模式是漏，第二个是滥，两个都要有钉子。
+    """
+    text = "error: Bearer authentication is required"
+    assert Redactor().text(text) == text
+
+
+def test_the_legacy_bearer_forms_still_work():
+    """回归：新增的头名规则不能把已有的 `bearer=` / `bearer: ` 形态挤掉。
+
+    两种形态各走各的规则（一条认 `[:=]`、一条认空白），互不重叠。
+    两条路都钉住，免得以后"修一处、坏一处"。
+    """
+    secret = "abc123def456ghi789xyz"
+    assert Redactor().text(f"bearer={secret}") == "bearer=<REDACTED:token>"
+    assert Redactor().text(f"bearer: {secret}") == "bearer: <REDACTED:token>"
+
+
+def test_an_already_redacted_header_is_not_redacted_twice():
+    """已脱敏的产物再洗一遍必须原样 —— 否则"洗过了"和"洗出新东西"分不开。
+
+    占位符 `<REDACTED:token>` 里有 `<` `>` `:` 三个不在字符类里的字符，
+    `REDACTED` 又只有 8 个字符（< 12），所以头名规则不会二次开火。
+    """
+    text = "Authorization: Bearer <REDACTED:token>"
+    assert Redactor().text(text) == text
+
+
+def test_a_short_value_after_bearer_is_left_alone():
+    """下限与既有规则一致（12 个字符）：短值不盖。"""
+    text = "Authorization: Bearer abc"
+    assert Redactor().text(text) == text
+
+
+def test_the_bearer_rule_counts_under_the_token_kind():
+    """计数必须并进 `token` 这个 kind —— 报告与看板上它就是"盖了几处凭证"。"""
+    r = Redactor()
+    r.text("Authorization: Bearer abc123def456ghi789xyz")
+    assert r.counts == {"token": 1}

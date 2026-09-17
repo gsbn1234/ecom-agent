@@ -48,7 +48,7 @@ def _p(kind: str, pattern: str, group: int = 0) -> tuple[str, re.Pattern[str], i
 #    反过来，订单号**没有**跨平台通用的形态，正则认不出来。
 #    所以订单号的正确做法是写进 YAML 的 `observability.redact_extra`（精确值），
 #    而不是指望这里猜。**这条限制写进 docs/guardrail_design.md 的
-#    「落盘脱敏的两条失效边界」一节，以及 tests/test_sanity_and_pii.py。**
+#    「落盘脱敏的失效边界」一节，以及 tests/test_sanity_and_pii.py。**
 _PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
     # 邮箱：形态稳定，可以放心用宽正则
     _p("email", r"[\w.+-]+@[\w-]+\.[\w.-]*[\w]"),
@@ -57,13 +57,22 @@ _PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
     # 身份证：17 位数字 + 校验位（数字或 X）
     _p("id_card", r"(?<!\d)\d{17}[\dXx](?!\d)"),
     # 会话/凭证类：键名保留，只盖值
-    # ★★ 已知缺口（2026-09-17 实测，守卫在 tests/test_sanity_and_pii.py 的 strict xfail）：
-    #    下面这条的 `[:=]` 要求在关键字**之后**，所以 `bearer` 这个分支只认
-    #    `bearer=<值>` / `bearer: <值>`，而**真实头部的规范形态**
-    #    `Authorization: Bearer <token>` 里冒号在 Bearer **之前** → 一个字都不盖。
-    #    `token:` / `api_key=` 形态正常，于是它看起来在工作 —— 这正是本模块 docstring
-    #    警告过的那种失效。修法：给"关键字 + 空白 + 值"单独一条规则。
     _p("token", r"(?i)\b(?:bearer|token|api[_-]?key|access[_-]?key|secret)\b\s*[:=]\s*[\"']?([A-Za-z0-9._\-]{12,})", 1),
+    # ★★ 授权头的「方案 + 空白 + 凭证」形态（2026-09-17 补，补的是上一条的缺口）：
+    #    上一条要求 `[:=]` 出现在关键字**之后**，而规范头部
+    #    `Authorization: Bearer <token>` 里冒号在 `Bearer` **之前** →
+    #    `bearer` 分支对它的规范形态一个字都不盖；而 `token:` / `api_key=` 是好的，
+    #    所以它**看起来在工作** —— 正是本模块 docstring 警告过的那种失效。
+    #
+    # ★ 为什么锚在头名上，而不是写成笼统的「bearer + 空白 + 值」：
+    #   后者会误伤真实散文。本机实测（不是推演）：
+    #       "error: Bearer authentication is required"
+    #     → "error: Bearer <REDACTED:token> is required"   把 authentication 当凭证盖了
+    #   `authentication` 有 14 个字符、又全在字符类里，所以它**必然**命中。
+    #   锚在 `authorization:` 之后，副作用面几乎为零，而本次要修的形态**恰好**在那里。
+    #   代价：不在头部、单说一句 `Bearer <值>` 的地方（比如 JSON 体里的字段）仍不盖 ——
+    #   那种形态等真见到再补，或者走 YAML 的 redact_extra，不在这里猜。
+    _p("token", r"(?i)\b(?:proxy-)?authorization\s*:\s*bearer\s+[\"']?([A-Za-z0-9._\-]{12,})", 1),
     _p(
         "cookie",
         r"(?i)\b(?:sessionid|session_id|sess_id|csrf[_-]?token|_csrf|antiforgery)\b\s*[:=]\s*[\"']?([A-Za-z0-9._\-]{8,})",
