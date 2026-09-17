@@ -1395,3 +1395,34 @@ Phase 5 的验收句是三条演示动作（实时滚动 / 点拒绝后改道 / 
 处置：UI 验证改用**页内 `evaluate` 直接派发**（没有坐标、没有中间层），
 并且"我点了 X"不算证据 —— 要有页面状态或服务端副作用作为独立证据。
 这条不影响项目本身，但它决定了**我怎么证明 UI 是对的**。
+
+## 附：CI 姿态在 Phase 5 上又验了一次（run `35212595111`，`f0f98ad`）
+
+Phase 4 建的那道门禁在 Phase 5 的推送上再跑一遍，两个 job 都绿：
+
+| job | 结论 | 判据 |
+|---|---|---|
+| 离线测试 | success | 318 条离线全绿（`跑离线测试` 这一步真执行，不是被跳过） |
+| 浏览器测试 | success | `门禁` 步 success，且**注解说的是哪条分支** |
+
+★ 关键在最后那格。`跑浏览器测试` 这一步挂着 `continue-on-error`，
+所以「测试真绿」和「环境不可用被放行」在 API 里**都是 `conclusion=success`**
+（Phase 4 已实测：步骤级 `continue-on-error` 下 `outcome=failure` 而
+`conclusion=success`）。读结论字段分不出来，得读注解：
+
+```
+needs_browser 结果=success → 绿（无需看环境）
+needs_browser 实际结果：11 passed, 318 deselected, 30 warnings in 21.26s ；退出码 0
+探针结论：环境可用 —— 库自己的启动路径成功 → 这台机器能跑 needs_browser
+```
+
+第一行是门自己写的分支判词，第二行是 pytest 的真实输出 —— 两者一起才构成"真绿"。
+**只有第一行的话，它可能是在说"环境坏了所以放行"**；只有第二行的话，
+它可能来自一个被 `continue-on-error` 吞掉的失败。这正是 Phase 4 把
+`continue-on-error` 从 job 级降到步骤级、并加一步 gate 的全部理由。
+
+⚠️ 一条与代码无关的预警（今天不处理）：两个 job 都有 GitHub 的
+`Node.js 20 is deprecated` warning —— `actions/checkout@v4` 与
+`actions/setup-python@v5` 正被强制跑在 Node 24 上。这类东西到某天会变成真红，
+而那时报错出现在 action 内部、跟我们自己的代码毫无关系。记录在此，
+下次动 CI 时顺手升版本。
