@@ -25,10 +25,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ecom_agent.config import CHROME_PATH, DB_PATH, HEADLESS, RUNS_DIR, TASKS_DIR
+from ecom_agent.config import CHROME_PATH, DB_PATH, HEADLESS, RUNS_DIR, TASKS_DIR, USER_DATA_DIR
 from ecom_agent.dsl.compiler import CompiledTask, ParamError, compile_task
 from ecom_agent.dsl.loader import TaskLoadError, load_task
 from ecom_agent.observability.models import BLOCKED, COMPLETED, FAILED
+from ecom_agent.runtime.profile import check_profile, describe_ready
 from ecom_agent.runtime.runner import PreflightError, RunOutcome, run_task
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
             _parse_params(args.param),
             chrome_path=args.chrome_path,
             headless=args.headless,
+            user_data_dir=args.profile,
         )
     except (TaskLoadError, ParamError, ValueError) as exc:
         print(f"编译失败：{exc}", file=sys.stderr)
@@ -124,6 +126,7 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
             _parse_params(args.param),
             chrome_path=args.chrome_path,
             headless=args.headless,
+            user_data_dir=args.profile,
         )
     except (TaskLoadError, ParamError, ValueError) as exc:
         print(f"编译失败：{exc}", file=sys.stderr)
@@ -147,6 +150,18 @@ async def cmd_run_async(args: argparse.Namespace) -> int:
     if args.dry_run:
         print("--dry-run：已编译，未启动浏览器")
         return EXIT_OK
+
+    if spec.requires_login:
+        # ★ 只在 requires_login 的任务上做这个检查 —— 只读 mock 任务不需要登录，
+        #   在它们身上每次都唠叨一遍，只会训练人忽略这句话。
+        #   ★ 这里是**警告不是拒绝**：没有 profile 的 run 是设计内的合法结果
+        #     （agent 看到登录页 → 按任务文本停下汇报），不该被拦住；
+        #     我们要消灭的是"它悄悄发生了"。
+        problem = check_profile(args.profile)
+        if problem:
+            print(f"⚠️  登录态检查：{problem}", file=sys.stderr)
+        else:
+            print(f"登录态：{describe_ready(args.profile)}")
 
     try:
         outcome = await run_task(
@@ -279,6 +294,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--no-headless", dest="headless", action="store_false", default=HEADLESS,
             help="显示浏览器窗口（排查问题时有用）",
+        )
+        p.add_argument(
+            "--profile", default=USER_DATA_DIR,
+            help="持久登录 profile 目录。默认取 ECOM_AGENT_USER_DATA_DIR"
+                 "（空 = 每次临时 profile，无状态）。"
+                 "★ 必须与 devtools/login_pdd.py 用的是**同一个**目录，"
+                 "否则会静默地以'需要人工登录'收尾、零行数据",
         )
 
     p_run = sub.add_parser("run", help="编译并运行一个任务")

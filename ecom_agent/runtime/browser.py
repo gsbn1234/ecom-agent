@@ -23,16 +23,77 @@
   恰恰是"如果按常规写法存了 browser_state 对象就会毁掉全部记录"的那一下。
   我们能安全地在最后 kill，唯一的原因是记录器在回调里就把值取走了。
   —— 关闭顺序本身就是那条纪律的验收。
+
+★★ 第二个坑（Phase 6 实测出来的，比上面那个更阴）：详见 `pin_user_data_dir`。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from ecom_agent.dsl.compiler import CompiledTask
 
 logger = logging.getLogger(__name__)
+
+
+def pin_user_data_dir(session: Any, profile_dir: str | Path) -> Path:
+    """把会话实际使用的 user_data_dir **钉回**我们给的目录。返回值是钉住的那个路径。
+
+    ★★ 为什么必须钉（2026-09-17 实测，不是读文档推断的）：
+
+      `BrowserProfile.model_post_init` 会调 `_copy_profile()`。只要 user_data_dir
+      非空、且它判定"这是 Chrome"，就把整个目录**拷到一个临时目录**再启动，
+      并把 `self.user_data_dir` 换成那个临时目录：
+
+          INFO [utils] Created new profile (Default) in temp directory:
+                      C:\\Users\\...\\Temp\\browser-use-user-data-dir-xxxx
+
+      这行 INFO 读起来人畜无害，实际含义是"**你给的那个目录根本没被用**"。
+
+      对我们的后果是致命的：**登录态写不回原目录**。人工扫码一次、脚本报成功、
+      cookie 落在 %TEMP% 里随进程消失 → 下一次 run 看到登录页 → 按任务文本
+      "遇登录页立即停止并汇报需要人工登录"收场 → 退出码 0、报告齐全、**零行数据**。
+      一条完全静默的失败，而且人会先去怀疑风控和 cookie 过期。
+
+    ★ 为什么不是"把目录名换成不含 chrome 的"：`is_chrome` 同时也看
+      executable_path，而我们永远传 chrome.exe —— 换个名字照样命中。
+    ★ 为什么不是"给目录起名 browser-use-user-data-dir-xxx"去命中库的豁免分支：
+      那是在**冒充库自己的临时目录**。库哪天加一句"清理自己的临时目录"，
+      我们的登录态就被删了 —— 借来的豁免迟早要还。
+    ★ 为什么钉在 `session.browser_profile` 上，而不是我们自己造一个 profile 传进去：
+      实测 `BrowserSession(browser_profile=我们造的)` **不使用**那个对象
+      （`is` 判定为 False），它自己再建一份，于是 _copy_profile 又跑一次。
+      钉在外部对象上等于没钉 —— 这个坑我先踩了一次才改对。
+    ★ 为什么是"构造之后赋值"而不是"构造前传参"：_copy_profile 只在
+      `model_post_init` 里跑一次（构造时），之后的赋值不会再触发它；
+      而启动参数是 `start()` 时才通过 `get_args()` 读的 —— 所以赋值来得及生效。
+      ⚠️ 这个时序是本函数成立的前提，`tests/test_profile_persistence.py` 用
+      真浏览器把它钉住了（含对照实验：不钉 → 登录态丢失）。
+
+    ⚠️ 已知代价，写在这里不藏：钉住之后，**同一个 profile 目录不能被两个会话同时用**
+      （Chrome 的 profile 独占锁）。以前库总是拷到各自的临时目录，反而"顺带"避开了
+      这个冲突。本项目 run 是串行的、登录脚本也不该和 run 并行，所以可以接受；
+      但"两个 run 同时用同一个 profile"会起不来 —— 那时的报错是 Chrome 的
+      profile 锁，跟"登录态"毫无关系，别再往风控上想。
+    """
+    target = Path(profile_dir)
+    profile = session.browser_profile
+    redirect = Path(profile.user_data_dir) if profile.user_data_dir else None
+    profile.user_data_dir = target
+
+    if redirect is not None and redirect != target:
+        # ★ 不静默：这正是"如果不钉会怎样"的证据，值得每次都说一句（DEBUG 级，
+        #   因为它对每次运行都成立、且我们已经处理了）。
+        logger.debug(
+            "库把 user_data_dir 重定向到了 %s（_copy_profile 的默认行为）；已钉回 %s",
+            redirect,
+            target,
+        )
+    logger.info("持久 profile：%s", target)
+    return target
 
 
 def build_browser_session(compiled: CompiledTask) -> Any:
@@ -41,6 +102,8 @@ def build_browser_session(compiled: CompiledTask) -> Any:
 
     kwargs = dict(compiled.browser_kwargs)
     session = BrowserSession(**kwargs)
+    if kwargs.get("user_data_dir"):
+        pin_user_data_dir(session, kwargs["user_data_dir"])
     logger.debug(
         "BrowserSession 已构造：allowed=%s prohibited=%s headless=%s executable=%s",
         kwargs.get("allowed_domains"),
@@ -114,3 +177,49 @@ async def kill_quietly(session: Any, *, started: bool = True) -> None:
             type(exc).__name__,
             exc,
         )
+
+
+async def close_gracefully_and_flush(session: Any, *, settle_s: float = 2.0) -> bool:
+    """优雅关掉 Chrome，让 **cookie 真的落盘**。返回是否走成了优雅路径。
+
+    ★★ 为什么登录流程不能用 `kill()` 收尾（2026-09-17 离线实测，三组对照）：
+
+      `kill()` 是强杀。而 **Chrome 的 cookie 库不是写一次落一次盘** ——
+      它按定时器批量提交（实测：设完 cookie 等 35 秒后库里就有行，
+      只等 3 秒则**零行**，而同一时刻 `document.cookie` 明明读得到）。
+      强杀时那些"还在内存里"的 cookie 直接消失。
+
+      后果同 pin_user_data_dir 那段：扫码成功 → 脚本报成功 → cookie 没了 →
+      下一次 run 看到登录页 → **静默零行**。
+
+    ★ 三条路的实测结果（都是真浏览器 + 本地 http.server，零 token）：
+        · 设完 cookie 等 35 秒再 kill   → 库里 1 行，新会话读得回来 ✔（但凭什么让用户等 35 秒）
+        · 走库的 `session.stop()` 再 kill → 库里 **0 行**，新会话读不到 ✘（stop 不等于优雅退出）
+        · **CDP 的 `Browser.close()`**    → 立刻优雅退出、库里 1 行，新会话读得回来 ✔ ← 用这条
+
+      `Browser.close` 是标准 CDP 命令（`cdp_client.send.Browser.close()`），
+      不是库的私有 API，所以它比"等定时器"和"猜 stop 的语义"都稳。
+
+    ⚠️ 关掉之后库的 StorageStateWatchdog 会连着报一串
+      `ConnectionError: Reconnection failed — CDP still not connected` 的 traceback
+      —— 那是它自己的后台任务发现浏览器没了。**与登录态无关，也不影响结果**，
+      所以这里只记一行 DEBUG，不当失败。
+    """
+    try:
+        await session.cdp_client.send.Browser.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "优雅关闭（CDP Browser.close）失败：%s: %s —— 退回强杀。"
+            "★ 这时 cookie 可能没落盘，请以随后的【新会话复核】结果为准",
+            type(exc).__name__,
+            exc,
+        )
+        await kill_quietly(session)
+        return False
+
+    # 给 Chrome 一点时间完成退出前的落盘动作（这一步是"等"而不是"猜"：
+    # 等不到也没关系 —— 复核步骤会当场揭穿）。
+    await asyncio.sleep(settle_s)
+    logger.debug("已用 Browser.close 优雅关闭浏览器（cookie 应已落盘）")
+    await kill_quietly(session)
+    return True

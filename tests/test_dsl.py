@@ -319,6 +319,28 @@ def test_chrome_path_only_passed_when_nonempty(pdd_spec):
     assert c.browser_kwargs["executable_path"] == "/tmp/chrome"
 
 
+def test_user_data_dir_only_passed_when_nonempty(pdd_spec):
+    """★★ 持久 profile 只在**显式给**的时候才传，而默认必须是"不传"。
+
+    两条理由，各对应下面的一个断言：
+      1. 传空串是同一个坑（库会拿 "" 当目录用）—— 所以空的时候这个键必须**不存在**；
+      2. 更要紧的是语义：不传 = 每次临时 profile（无状态、可复现），
+         传了 = 复用带 cookie 的目录（有状态）。默认必须是无状态的那个 ——
+         否则 CI 里 11 条浏览器用例会共用一个 cookie 目录，测试之间互相污染，
+         而且只在特定执行顺序下才暴露。
+
+    ★ 两个断言缺一不可：只断言"默认没有"的话，**把整个 kwarg 删掉也能通过**。
+      存在的那一半才是对照。
+    """
+    assert "user_data_dir" not in compile_task(pdd_spec, {"keyword": "x"}).browser_kwargs
+    assert (
+        "user_data_dir" not in compile_task(pdd_spec, {"keyword": "x"}, user_data_dir="").browser_kwargs
+    )
+
+    c = compile_task(pdd_spec, {"keyword": "x"}, user_data_dir="/tmp/prof")
+    assert c.browser_kwargs["user_data_dir"] == "/tmp/prof"
+
+
 def test_output_model_resolved(pdd):
     assert pdd.output_model is resolve_output_model("pdd.ProductRowList", 1)
     assert "pdd.ProductRowList" in registered()

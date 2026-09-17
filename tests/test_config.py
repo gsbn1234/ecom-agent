@@ -67,6 +67,45 @@ def test_chrome_path_empty_string_means_autodetect(cfg):
     assert importlib.reload(cfg).CHROME_PATH == ""
 
 
+def test_user_data_dir_is_empty_by_default(cfg):
+    """★ 默认必须是"不使用持久 profile"。
+
+    ★★ 这条守的是一个**语义**问题，不是格式问题：持久 profile 是**有状态**的
+      （里面是登录 cookie）。把有状态的东西设成默认，等于让 CI 的浏览器用例
+      共用一个 cookie 目录 —— 互相污染，且只在特定执行顺序下才暴露。
+      默认无状态 = 每次跑都从同一个起点出发，可复现。
+    """
+    assert cfg.USER_DATA_DIR == ""
+
+
+def test_user_data_dir_empty_string_is_not_replaced_by_the_convention(cfg):
+    """★ 空串 ≠ 未设置：空串就是"我明确不要持久 profile"。
+
+    如果实现里写成 `os.getenv(...) or DEFAULT_PROFILE_DIR`，空串会被 `or` 吃掉、
+    变成"默默启用了持久 profile" —— 于是 CI 上第一次跑就写了一个
+    browser_profile/ 目录，而没人下过这个决定。
+    （这个坑与 CHROME_PATH 那条同源，见上面 test_chrome_path_empty_string_*。）
+    """
+    os.environ["ECOM_AGENT_USER_DATA_DIR"] = ""
+    assert importlib.reload(cfg).USER_DATA_DIR == ""
+
+
+def test_user_data_dir_env_override_wins(cfg):
+    os.environ["ECOM_AGENT_USER_DATA_DIR"] = "/tmp/prof"
+    assert importlib.reload(cfg).USER_DATA_DIR == "/tmp/prof"
+
+
+def test_default_profile_dir_is_inside_the_project_and_gitignored():
+    """★ 约定位置必须同时满足两件事：在项目里（好找）+ 被 .gitignore 挡住。
+
+    里面是登录 cookie，提交上去 = 别人能登你的后台。所以这里直接读 .gitignore
+    来验，而不是相信"我加过了"。
+    """
+    assert config.PROJECT_ROOT in config.DEFAULT_PROFILE_DIR.parents
+    ignored = (config.PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert f"{config.DEFAULT_PROFILE_DIR.name}/" in ignored
+
+
 def test_live_llm_needs_both_flag_and_key(cfg):
     """双条件开关：只有 flag 没 key、或只有 key 没 flag，都必须为 False。
 

@@ -265,6 +265,7 @@ def compile_task(
     chrome_path: str = "",
     headless: bool = True,
     keep_alive: bool = True,
+    user_data_dir: str = "",
 ) -> CompiledTask:
     """编译。这是 Phase 1 的对外主入口。"""
     resolved_params = _coerce_params(spec, params)
@@ -287,6 +288,23 @@ def compile_task(
         #   传空串会让 browser-use 去找一个名为 "" 的文件并报一个看不懂的错；
         #   不传则它自己走 find_chrome_executable() 探测系统 Chrome。
         browser_kwargs["executable_path"] = chrome_path
+    if user_data_dir:
+        # ★ 只在显式指定时才传 user_data_dir，理由与 executable_path 同源，
+        #   但**更要紧的是语义**，所以单独写一遍：
+        #
+        #   不传 = 每次一个临时 profile（无状态）→ 默认。
+        #   传了 = 复用这个目录里的 cookie（有状态）→ 登录态就是这么来的：
+        #         人工跑一次 devtools/login_pdd.py 扫码，之后 run 复用同一目录，
+        #         **凭据根本不进 Agent**（不进提示词、不进截图、不需要脱敏代码）。
+        #         这比 sensitive_data 占位符替换更硬，见 README 的 ADR-8。
+        #
+        #   ⚠️ 但传了它就必须传**对**：传一个没登录过的目录不会报错，
+        #      只会让 agent 看到登录页 —— 而任务文本里写的是"遇登录页立即停止
+        #      并汇报需要人工登录"，于是整个 run 以一句"需要登录"正常结束，
+        #      退出码、报告、落库全都正常。**这是一条完全静默的失败**。
+        #      所以 CLI 侧配了用前检查（runtime/profile.py）：空路径、目录不存在、
+        #      目录没有登录标记，三种情况都会在启动前说出来。
+        browser_kwargs["user_data_dir"] = user_data_dir
 
     agent_kwargs: dict[str, Any] = {
         "use_vision": spec.agent.use_vision,

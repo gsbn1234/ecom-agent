@@ -75,6 +75,26 @@ CHROME_PATH = CHROME_PATH.strip()
 
 HEADLESS = os.getenv("ECOM_AGENT_HEADLESS", "true").strip().lower() == "true"
 
+# ── 持久登录 profile（Phase 6）────────────────────────────
+# ★ 空 = **不使用**持久 profile：每次 run 一个临时 profile，无状态、可复现。
+#   这是默认值，且必须是默认值 —— 另外那个选项是"复用一个带登录 cookie 的目录"，
+#   是**有状态**的。把有状态的东西设成默认，等于让 CI 的 11 条浏览器用例
+#   共用一个 cookie 目录：测试之间互相污染，而且只在特定执行顺序下才暴露出来
+#   （同一台机器上两个 Chrome 用同一个 profile 目录，后起的那个会直接起不来）。
+#
+# ★ 为什么不能"想用的时候自己传路径"就完事：**登录脚本和 run 必须指向同一个目录**。
+#   两边各传各的，不一致时不会有任何报错 —— 表现是"明明扫码登录过了，跑起来还是
+#   登录页"，而那时人会去怀疑 cookie 过期、怀疑风控，方向从一开始就是错的。
+#   所以这个值放在这里，两边都读它（CLI 的 --profile、devtools/login_pdd.py）。
+USER_DATA_DIR = os.getenv("ECOM_AGENT_USER_DATA_DIR", "").strip()
+
+# ★ 显式配置为空时的**约定位置**。它不参与 BrowserSession 的构造（空就是不传），
+#   只用来在两处说同一句话：登录脚本默认写这儿，CLI 的警告也建议设成这儿。
+#   单点定义是为了让这两句话永远一致 —— 否则用户照着警告设了值，
+#   登录脚本却写去了另一个目录，就又回到上面那个静默的不一致。
+DEFAULT_PROFILE_DIR = PROJECT_ROOT / "browser_profile"
+#   （`browser_profile/` 已在 .gitignore 里：里面是登录 cookie，泄漏 = 别人能登你的后台。）
+
 # ── 是否允许真调 LLM ──────────────────────────────────────
 # ★ 开关型配置的「双条件」：布尔 flag AND key 非空。缺一样就静默关闭、不报错，
 #   因为 CI 和单测都应该在「没有真 key」的情况下正常跑完全部用例。
