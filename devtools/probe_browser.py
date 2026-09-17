@@ -159,13 +159,33 @@ async def _try_launch(
 
     返回 (结论, stderr, 退出码)。结论 ∈ {"cdp_ok", "exited", "timeout"}。
     """
-    proc = await asyncio.create_subprocess_exec(
-        browser_path,
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        # ★ 和库第 150 行完全一样是 PIPE —— 区别只在于【我们真的读它】。
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            browser_path,
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            # ★ 和库第 150 行完全一样是 PIPE —— 区别只在于【我们真的读它】。
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as e:
+        # ★★ 这个 except 是 2026-09-17 补的，来自一次真 run 的教训
+        #    （run 35205084140，对照实验三）：
+        #    把 ECOM_AGENT_CHROME_PATH 指向一个不存在的路径时，这一行直接抛
+        #    FileNotFoundError 穿透出去 → 探针**崩** → 结论文件压根不写 →
+        #    gate 只能说"结论文件不存在"，而"哪个路径、什么错"只在
+        #    **要 admin 权限**的日志里。
+        #    红是对的（fail-closed），但**红不可读** —— 而"红的原因不可读"
+        #    正是让人开始忽略 CI 的第一步，这条纪律本项目已经付过两次学费。
+        #    现在：不抛了，把"起不来"当成一个**结论**报出去。
+        #    ⚠️ 判决不改：见 spawn_failed_verdict —— 仍然是真红，判据一格不放宽。
+        #
+        #    ★ 路径是【我们自己拼进去】的，不是从异常消息里捞的 —— 这条也是测试逼出来的：
+        #      Linux 上 FileNotFoundError 的消息带路径
+        #      （"[Errno 2] No such file or directory: '/x/chrome'"），
+        #      Windows 上【不带】（"[WinError 2] 系统找不到指定的文件。"）。
+        #      靠异常消息 = 在 CI 上可读、在自己机器上不可读，而"自己机器上"
+        #      恰恰是这个错误最常发生的地方。要报的东西自己带上，别转手。
+        return "spawn_failed", f"{type(e).__name__}: {e}（路径={browser_path}）", None
     print(f"  进程 PID = {proc.pid}")
 
     deadline = asyncio.get_running_loop().time() + timeout
@@ -397,6 +417,52 @@ def _forensics(log_path: str) -> int:
     return 0
 
 
+# ── 判决的两个"长得像、后果相反"的分支 ──────────────────────
+#
+# ★★ 这两个函数放在一起是有意的：它们的输入都是"没有 Chrome 能用"，
+#    返回值却相反。把它们并排摆着，那个区别就没法被无意中改掉 ——
+#    tests/test_probe_forensics.py 里有一条**成对**的断言盯着它们。
+def no_chrome_found_verdict() -> tuple[bool, str]:
+    """**一个** Chrome 可执行文件都没有：没人指定 + 自动探测也是空。
+
+    ★ 返回 False = 环境不可用 = gate 会放行。
+    """
+    return False, "browser-use 找不到任何 Chrome 可执行文件"
+
+
+def spawn_failed_verdict(path: str, exc: str) -> tuple[bool, str]:
+    """Chrome 路径**有人指定**，但那个进程压根起不来 → (usable, reason)。
+
+    ★★ 返回 True = 按「环境可用」处理 = gate 会判**真红**。
+
+    跟上面那个的区别只有一句话：
+
+        谁指定的，谁负责。
+
+      · 没人指定、哪儿都找不到 → 环境里确实没有 Chrome → 环境问题 → 可放行；
+      · 有人指定了、但那行配置指向的东西起不来 → 是**有人写错了** → 配置问题
+        → 该由我们看见。
+
+    第二条的理由和 main() 里「探针能起、库的路径起不来 → 判成可用」是同一条：
+    **唯一能靠改配置修掉的那一类故障必须留给我们自己。**
+
+    ★ 判据每放宽一格，就多一类真失败可能被洗成绿 —— 而"红能被解释掉"本身
+      没有价值，除非那个解释是**可证的**。一个起不来的路径不构成"这台 runner
+      不行"的证明，它只证明了**这行配置是错的**。
+
+    ★ 路径**保证出现，但不重复**：`exc` 通常已经带了路径（`_try_launch` 会拼），
+      只有没带时才补。要的是"读的人一定看得到是哪个路径"，不是"这句话里
+      路径出现两次"。这个 if 不是省字数 —— 一份会重复自己的注解，
+      读起来像机器拼的，而注解的全部价值在于有人肯读它。
+    """
+    if path and path not in exc:
+        exc = f"{exc}（路径={path}）"
+    return True, (
+        f"探针自己那一次压根没起来（{exc}）"
+        "—— 属于【配置问题】不是环境问题，按真红处理"
+    )
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if argv and argv[0] == "--fatal-lines":
@@ -423,6 +489,7 @@ def main() -> int:
         "chrome_found": None,
         "chrome_path": "",
         "stage1_self_launch": None,
+        "stage1_error": None,
         "stage2_library_launch": None,
         "stage2_error": None,
         "fatal_lines": [],
@@ -457,7 +524,8 @@ def main() -> int:
     print(f"实际使用                    -> {browser_path}")
     if not browser_path:
         _ann("warning", "browser-use 找不到 Chrome —— 下游浏览器测试的红是【环境问题】，不是代码问题")
-        V.update(usable=False, reason="browser-use 找不到任何 Chrome 可执行文件")
+        usable, reason = no_chrome_found_verdict()
+        V.update(usable=usable, reason=reason)
         _write_verdict(verdict_path, V)
         return 0
     print(f"版本      : {_chrome_version(browser_path)}")
@@ -505,6 +573,23 @@ def main() -> int:
     print(f"\n启动结论  : {verdict}   退出码: {code}")
     print(f"Chrome 的 stderr: {stderr or '（空）'}")
     V["stage1_self_launch"] = verdict
+
+    if verdict == "spawn_failed":
+        # ★★ 这条分支以前不存在 —— 以前这里是**直接崩掉**的（见 _try_launch 里那段）。
+        #    崩溃的后果不是"红"（红是对的），是**红不可读**：
+        #    结论文件没写出来 → gate 只会说"结论文件不存在"，
+        #    而死因（哪个路径、什么错）全在要 admin 权限的日志里。
+        #    现在做两件事，判决一格不动：
+        #      1. 把死因抬成**公开注解**，陌生人也能读到原因；
+        #      2. 仍然往结论文件里写一份（usable=True，见 spawn_failed_verdict），
+        #         于是 gate 那条注解里会**带上这个 reason** —— 报绿/报红的地方
+        #         同时也是解释原因的地方。
+        _ann("error", f"Chrome 起不来: {stderr}")
+        usable, reason = spawn_failed_verdict(browser_path, stderr)
+        V.update(usable=usable, reason=reason)
+        V["stage1_error"] = stderr
+        _write_verdict(verdict_path, V)
+        return 0
 
     if verdict == "cdp_ok":
         _ann("notice", "第一段：按库的参数能起 Chromium 且 CDP 就绪 → 环境没问题，差别在库的启动方式")

@@ -163,3 +163,55 @@ def test_ann_escapes_for_github_annotations(capsys):
     assert "95%25" in ann[0], "裸露的 % 没转义，GitHub 会解析错位"
     assert "%252F" in ann[0], "% 没【先】转 —— 字面量 %2F 被当成了换行标记"
     assert ann[0].rstrip().endswith("%0A第二行"), "换行没转成 %0A"
+
+
+# ── 判决方向：两个"长得像、后果相反"的分支 ────────────────────
+def test_the_two_similar_looking_failures_are_judged_oppositely():
+    """★★ 对照实验：「没人指定」和「指定了但起不来」判决必须相反。
+
+    这两件事的**表象**一样（都没有可用的 Chrome），后果却相反，
+    而它们的区别只有一句话 —— **谁指定的，谁负责**：
+
+      · 一个都没有           → 环境里确实没装 → 环境问题 → usable=False（gate 放行）
+      · 有人指定了但起不来   → 是【有人写下的那行配置错了】→ 配置问题
+                              → usable=True（gate 判**真红**）
+
+    为什么要写成**成对**的断言：单看任何一条都像是随手定的默认值，
+    成对摆着才能看出这是一个**非对称的设计决定**。谁哪天把它"顺手改一致"，
+    这条会红，然后被迫去读那两个 docstring。
+    """
+    from devtools.probe_browser import no_chrome_found_verdict, spawn_failed_verdict
+
+    # 对照组：没人指定 → 放行
+    assert no_chrome_found_verdict()[0] is False
+    # 实验组：指定了但起不来 → 真红
+    usable, reason = spawn_failed_verdict("/nope/chrome", "FileNotFoundError: [Errno 2]")
+    assert usable is True, "钉死的路径起不来被判成了『环境不可用』—— 那会把真失败洗成绿"
+    # 理由里必须带上【路径】：只说"起不来"等于把死因又推回要 admin 的日志里
+    assert "/nope/chrome" in reason
+    assert "配置问题" in reason
+
+
+def test_try_launch_reports_a_missing_binary_instead_of_raising():
+    """★ 这条来自一次真 run（35205084140）：探针原来会**崩**在这里。
+
+    崩掉的后果不是"红"（红是对的），是**红不可读** ——
+    结论文件压根没写出来，gate 只能说"结论文件不存在"。
+
+    不需要浏览器：create_subprocess_exec 会立刻抛 FileNotFoundError。
+    """
+    import asyncio
+
+    from devtools.probe_browser import _try_launch
+
+    verdict, err, code = asyncio.run(_try_launch("/definitely/not/here/chrome", [], 1))
+
+    assert verdict == "spawn_failed", f"没抛是好事，但结论不对：{verdict!r}"
+    assert code is None
+    # 死因要能在注解里读出来：异常类型 + 那个路径
+    assert "FileNotFoundError" in err or "No such file" in err, err
+    # ★ 断言的是【路径必须出现】，而不是"异常消息里恰好有路径"：
+    #   Windows 的 FileNotFoundError 消息里【没有路径】，Linux 的有。
+    #   靠异常消息的写法会在 CI（Linux）上通过、在自己机器（Windows）上失效，
+    #   而后者恰恰是这个错误最常撞见的地方。所以路径由我们自己拼进去。
+    assert "/definitely/not/here/chrome" in err, f"注解里读不到是哪个路径起不来: {err}"
