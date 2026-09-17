@@ -5,13 +5,14 @@
 不改动 browser-use 源码 —— 把它当执行引擎，上层包自己的业务逻辑：任务 DSL、三层安全护栏、
 结构化落库、逐步可观测与回放。首个适配平台是拼多多商家后台（`mms.pinduoduo.com`）。
 
-> 🚧 施工中。当前进度：**Phase 2 已完成**（骨架 / DSL + 护栏策略 / 真浏览器探路）。
-> 下一步 Phase 3：可观测 + runner + 落库（`main.py run` 产出 `runs/{id}/` 全套产物）。
+> 🚧 施工中。当前进度：**Phase 0–6 已完成**（骨架 / DSL + 护栏策略 / 真浏览器探路 /
+> 可观测与落库 / mock 站点 e2e + CI / Web 看板 / 真站点首跑）。
+> 下一步 Phase 7：护栏实战 + README/ADR 定稿 —— **README 的 ADR 那几节还没写**。
 >
-> 已完成的文档：`docs/spikes.md`（七项探路的实测结论）、
+> 已完成的文档：`docs/spikes.md`（探路实测结论 + 逐条判据 + CI 排查全程）、
 > `docs/guardrail_design.md`（三层护栏各能挡什么、**挡不住什么**）。
 >
-> 测试现状：153 条 = 145 条离线（CI 硬门禁）+ 8 条 `needs_browser`
+> 测试现状：380 条 = 367 条离线（CI 硬门禁）+ 13 条 `needs_browser`
 > （本地硬门禁；CI 上已跑通，见 CI 说明）。
 
 ---
