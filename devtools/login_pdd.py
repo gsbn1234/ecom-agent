@@ -60,6 +60,11 @@ from ecom_agent.runtime.browser import (  # noqa: E402
     kill_quietly,
     pin_user_data_dir,
 )
+from ecom_agent.runtime.loginstate import (  # noqa: E402
+    LOGGED_IN,
+    classify,
+    read_page_state,
+)
 from ecom_agent.runtime.profile import (  # noqa: E402
     ProfileMarkError,
     read_mark,
@@ -74,46 +79,9 @@ SITE = "mms.pinduoduo.com"
 POLL_INTERVAL_S = 3.0
 BEAT_EVERY_S = 15.0
 
-# ── 判定词汇 ──────────────────────────────────────────────
-# ★ 判定是**保守**的，而且允许"判不出来"这第三种结果。
-#   把它们做成二值（登录了/没登录）会逼着脚本在一个它其实看不清的画面上选一个，
-#   而选错的方向恰好是最坏的那个：把"没登录"报成"登录了"。
-LOGIN_PAGE_HINTS = ("扫码登录", "账号登录", "密码登录", "短信登录", "请登录", "登录/注册")
-LOGGED_IN_HINTS = ("商品管理", "订单管理", "发货管理", "售后管理", "数据中心", "店铺", "商家后台")
-
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def classify(url: str, dom_text: str) -> tuple[str, str]:
-    """返回 (判定, 依据)。判定 ∈ {"logged_in", "login_page", "unknown"}。
-
-    ★ 依据一并返回，因为它要**原样打给人看** —— 判定错了的时候，
-      唯一能让人快速看出"是脚本看错了还是真的没登录"的就是它。
-    """
-    low = url.lower()
-    if "/login" in low or "passport" in low:
-        return "login_page", f"URL 落在登录路径上：{url}"
-
-    logged = [w for w in LOGGED_IN_HINTS if w in dom_text]
-    if logged:
-        return "logged_in", f"页面上出现了登录后才有的导航：{'、'.join(logged[:3])} @ {url}"
-
-    login_ish = [w for w in LOGIN_PAGE_HINTS if w in dom_text]
-    if login_ish:
-        return "login_page", f"页面上出现登录字样：{'、'.join(login_ish[:3])} @ {url}"
-
-    return "unknown", f"URL 与页面文本都不足以判定（{url}，正文 {len(dom_text)} 字符）"
-
-
-async def snapshot(session) -> tuple[str, str]:
-    """取一次 (url, DOM 文本)。★ 只读本机 CDP，不产生新请求。"""
-    state = await session.get_browser_state_summary(include_screenshot=False)
-    dom_text = ""
-    if state.dom_state is not None:
-        dom_text = state.dom_state.llm_representation() or ""
-    return (state.url or ""), dom_text
 
 
 async def open_session(profile: Path, *, headless: bool):
@@ -142,13 +110,13 @@ async def wait_for_login(session, *, timeout_s: float) -> tuple[str, str]:
     verdict, why = "unknown", "还没开始看"
     while time.monotonic() - started < timeout_s:
         try:
-            url, dom_text = await snapshot(session)
+            url, dom_text = await read_page_state(session)
         except Exception as exc:  # noqa: BLE001
             # 窗口被人关掉了 / 会话断了。这不是"登录失败"，是"没法再看了"。
             return "unknown", f"读取页面状态失败（窗口关了？）：{type(exc).__name__}: {exc}"
         verdict, why = classify(url, dom_text)
 
-        if verdict == "logged_in":
+        if verdict == LOGGED_IN:
             return verdict, why
 
         elapsed = time.monotonic() - started
@@ -171,7 +139,7 @@ async def phase_a_human_login(profile: Path, url: str, timeout_s: float) -> tupl
         verdict, why = await wait_for_login(session, timeout_s=timeout_s)
         print(f"   判定：{verdict} —— {why}")
 
-        if verdict != "logged_in":
+        if verdict != LOGGED_IN:
             # ★ 判不出来时留一张图，让人自己看一眼。这是"判不出来"唯一的出路：
             #   我们看不清，就把画面交给人，而不是猜一个结论。
             shot = profile / f"login_unclear_{datetime.now().strftime('%Y%m%dT%H%M%S')}.png"
@@ -225,9 +193,9 @@ async def phase_b_verify_fresh(profile: Path, url: str) -> tuple[bool, str, str]
         await session.navigate_to(url)
         # 给页面一点时间完成跳转（这里是一次性等待，不是轮询）。
         await asyncio.sleep(3.0)
-        final_url, dom_text = await snapshot(session)
+        final_url, dom_text = await read_page_state(session)
         verdict, why = classify(final_url, dom_text)
-        return verdict == "logged_in", why, final_url
+        return verdict == LOGGED_IN, why, final_url
     finally:
         await close_gracefully_and_flush(session)
 

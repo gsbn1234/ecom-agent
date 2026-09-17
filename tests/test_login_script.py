@@ -7,9 +7,9 @@
   报"需要人工登录"、零行数据 —— 而线索（标记文件）看起来完全正常。
   换句话说：脚本报的"成功"必须是**它自己验过的**成功，这条性质值得被测。
 
-★ 另一半是**判定本身**：`classify()` 是脚本唯一"看画面下结论"的地方，
-  而它必须是三值的。二值化会逼着它在看不清的画面上选一个，
-  而选错的方向恰好最坏（把"没登录"报成"登录了"）。它是纯函数，正好能测。
+★ 判定那一半（`classify()` 的三值语义）已随代码搬去 `tests/test_loginstate.py`
+  —— 判定逻辑从本脚本移进了库（`ecom_agent/runtime/loginstate.py`），因为 run
+  也要用它来记录"这次到底登进去没有"。本文件现在只管**脚本自己的决策链**。
 
 ★ 这一整个文件都不开浏览器：`run()` 的三处外部依赖（人、开浏览器、优雅关闭）
   全部被替换掉了，测的是**决策链**。
@@ -26,67 +26,7 @@ GOODS = "https://mms.pinduoduo.com/goods/goods_list"
 
 
 # ══════════════════════════════════════════════════════════
-# 一、classify：三值判定
-# ══════════════════════════════════════════════════════════
-def test_a_login_url_beats_page_text():
-    """★ URL 落在登录路径上时，**页面文字不作数**。
-
-    ★ 对照在同一用例里取：同样的页面文字、换一个正常 URL → 判成 logged_in。
-      没有这一半的话，一个"永远返回 login_page"的实现也能让上面通过，
-      而那种实现的表现是"扫完码脚本还说没登录"，人只会以为码扫失败了。
-    """
-    dom = "商品管理 订单管理 扫码登录"
-    assert login_pdd.classify(PASSPORT, dom)[0] == "login_page"
-    assert login_pdd.classify(GOODS, dom)[0] == "logged_in"
-
-
-def test_a_neutral_page_is_unknown_not_a_guess():
-    """★★ 判不出来时必须是 unknown —— **不能**倒向任何一边。
-
-    这一条守的是失败方向：把"没登录"错报成"登录了"，后果是零行数据 + 一句
-    把人引去查风控的"需要人工登录"；而把"登录了"错报成"没登录"，
-    后果只是白扫一次码。两个方向的代价差得很远，所以**不猜**。
-
-    ★ 对照：同一页面上加一个登录后才有的词 → 必须判成 logged_in。
-      没有这一半，"永远返回 unknown"的实现也能让上面通过。
-    """
-    verdict, why = login_pdd.classify(GOODS, "正在加载…")
-    assert verdict == "unknown", f"看不清却给了结论：{verdict}（{why}）"
-    assert verdict != "login_page", "判不出来时倒向'没登录'是错的方向 —— 它会让人白扫一次码"
-
-    assert login_pdd.classify(GOODS, "正在加载… 商品管理")[0] == "logged_in"
-
-
-def test_login_hints_alone_are_enough_to_say_login_page():
-    """只有一个词也算数：这是"人还没扫"的正常状态（页面停在扫码登录）。"""
-    assert login_pdd.classify(GOODS, "请扫码登录")[0] == "login_page"
-
-
-def test_the_reason_carries_the_evidence_the_human_needs():
-    """依据要**原样打给人看**，所以它必须自己就能解释结论。
-
-    ★ 判错的时候，唯一能让人快速分清"脚本看错了"还是"真的没登录"的就是它。
-      于是：命中了哪些词、看的是哪个 URL，都要在里面。
-    """
-    _, why = login_pdd.classify(GOODS, "请扫码登录")
-    assert "扫码登录" in why, "要说清命中了哪个词"
-    assert GOODS in why, "要说清是在哪个 URL 上判的"
-
-    # ★ 另一半：判成 logged_in 时同样要说清命中了哪个词。
-    #   ⚠️ 第一次写这条测试时我把两半写反了（用一个同时含两类词的页面去断言
-    #   "依据里该有登录词"）—— 而 classify 是先看登录后才有的词的，
-    #   所以依据里出现的是"商品管理"。测试红了，红得对：它暴露的是我的预期错了，
-    #   不是代码错了。两半分开写才不会有这种歧义。
-    _, why_in = login_pdd.classify(GOODS, "商品管理")
-    assert "商品管理" in why_in, "判成已登录时也要说清凭哪个词判的"
-
-    _, why = login_pdd.classify(GOODS, "空的")
-    assert GOODS in why
-    assert "unknown" not in why, "依据是给人看的，别把内部枚举塞进去"
-
-
-# ══════════════════════════════════════════════════════════
-# 二、run()：写不写标记这件事
+# run()：写不写标记这件事
 # ══════════════════════════════════════════════════════════
 class _DomState:
     def __init__(self, text: str) -> None:
