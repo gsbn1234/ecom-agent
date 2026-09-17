@@ -62,6 +62,9 @@ from ecom_agent.actions.guard_gate import GUARD_NOTICE_ACTION  # noqa: E402
 from ecom_agent.config import CHROME_PATH, HEADLESS  # noqa: E402
 from ecom_agent.dsl.compiler import compile_task  # noqa: E402
 from ecom_agent.dsl.loader import load_task  # noqa: E402
+from ecom_agent.guardrails.approver import AutoDenyApprover  # noqa: E402
+from ecom_agent.observability.events import EventBus  # noqa: E402
+from ecom_agent.observability.events import events_from_run_dir  # noqa: E402
 from ecom_agent.runtime import runner as R  # noqa: E402
 from ecom_agent.runtime.runner import run_task  # noqa: E402
 from ecom_agent.sites.pinduoduo.output_models import ParseStatus  # noqa: E402
@@ -193,6 +196,10 @@ def _guard_notice_step(steps: list[dict[str, Any]]) -> dict[str, Any]:
     assert len(hits) == 1, (
         f"预期恰好有 1 步记录了 {GUARD_NOTICE_ACTION}，实际 {len(hits)} 步。"
         f"每步的动作：{[[a['name'] for a in s['actions']] for s in steps]}\n"
+        f"  0 步 → 那一击**根本没被拦**（或者压根没打出去），护栏在这条链路上是空的；\n"
+        f"  ≥2 步 → 护栏拦了不止一次：LLM 在重试同一个被拦的动作（**没改道**），"
+        f"或者换了别的动作又被拦。这一条是用例 C 的对照实验实测出来的 ——"
+        f"把一个「不读拒绝、原地再试一次」的脚本喂进去，红的就是这里。\n"
         f"  ⚠️ 如果某步的动作里出现了 click，那不是「找错了名字」——"
         f"    是护栏把被拦的动作**放过去并记录**了，属于更严重的问题。"
     )
@@ -553,3 +560,299 @@ async def test_guarded_run_blocks_the_click_and_still_collects_rows(
     assert any(d["rule_id"] == "exempt:done" for d in done_step["guardrail_decisions"]), (
         f"done 那一步没有豁免记录：{done_step['guardrail_decisions']}"
     )
+
+
+# ══════════════════════════════════════════════════════════
+# 用例 C —— Phase 5 的验收：审批被拒之后，LLM 改道了
+# ══════════════════════════════════════════════════════════
+DENY_RUN_ID = "e2e-deny"
+
+
+def _prompt_text(messages: list[Any]) -> str:
+    """这一步的提示词全文。用 `_text_of`（stubs/fake_llm 里那个扁平化函数）
+    而不是自己再写一份：它拼出来的就是 FakeLLM 在断言里看到的同一段文本。"""
+    return "\n".join(_text_of(m) for m in messages)
+
+
+def _click_by_label(label: str):
+    """造一个"点这一页上文本为 `label` 的那个元素"的脚本步。"""
+
+    def step(messages: list[Any], _step_index: int) -> dict[str, Any]:
+        return {"click": {"index": _click_target_index(_prompt_text(messages), label)}}
+
+    return step
+
+
+def reroute_after_denial(messages: list[Any], _step_index: int) -> dict[str, Any]:
+    """★★ 扮演一个【读到拒绝就改道】的 LLM。
+
+    这里刻意让改道**依赖于**提示词里那句 `HUMAN_DENIED` ——
+    找不到就当场断言失败，而不是"默默地也去点查看详情"。差别在于证伪力：
+    后者在"护栏根本没把话说给 LLM 听"的情况下**照样会绿**，
+    而"那句话到底有没有送到 LLM 面前"恰恰是这个演示要证明的东西。
+    （同 `test_guarded_run_...` 判据 4 的分工：那条验"送到了"，这条验"送到了有用"。）
+
+    ★ 顺带钉住一件容易忽略的事：拒绝意味着那一击**没有执行**，
+      所以这一刻页面**还是列表页**。若护栏漏放，浏览器早就跳到详情页了，
+      这里会以"提示词里找不到「查看详情」"（0 个）的形式失败 ——
+      一个指向护栏、但报错文本不提护栏的失败。所以下面那句提示里明写了这层因果。
+    """
+    text = _prompt_text(messages)
+    assert "HUMAN_DENIED" in text, (
+        "被拒之后的提示词里没有 HUMAN_DENIED —— 被拒这件事没告诉 LLM。\n"
+        "  于是这里的「改道」只能是脚本自己本来就打算做的事，而不是【读了拒绝才改的道】。\n"
+        "  这是护栏最容易坏、也最难看出来的一种坏法：动作拦住了（写没发生），\n"
+        "  但 LLM 会一遍遍重试同一个动作，直到撞满步数上限。\n"
+        f"  ── 该步提示词片段 ──\n{text[:2000]}"
+    )
+    try:
+        return {"click": {"index": _click_target_index(text, "查看详情")}}
+    except AssertionError as exc:
+        raise AssertionError(
+            f"{exc}\n  ⚠️ 注意：此刻页面本应**仍是列表页**（那一击被拒=没执行）。"
+            f"若提示词里没有「查看详情」，先确认护栏有没有把 click 放行 ——"
+            f"放行的话浏览器已经跳到详情页了，那里当然没有这个链接。"
+        ) from exc
+
+
+async def test_denied_approval_makes_the_llm_reroute(
+    mock: str, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """★★★ Phase 5 的演示主镜头：审批卡片被拒 → LLM 改道 → 任务照样完成。
+
+    这条用例的存在理由，是"点拒绝之后会发生什么"在本项目里**只被推理过、
+    没被跑过**。而在它之前，能自动验的东西到"审批请求送到了人面前"为止 ——
+    后半段（人说不 → 那句话回到 LLM → LLM 换动作 → run 继续）整段是空白。
+    空白的原因很实际：手工测试时人总是点"批准"（你在验任务能不能跑完），
+    所以最容易被漏掉的分支永远是"被拒绝"那条（同 AutoDenyApprover 的注释）。
+
+    ★★ 这个演示**可证伪**，不是"为了演示而演示"：
+      mock 列表页上「查看详情」和「编辑」指向**同一个 href**
+      （devtools/mock_pdd/pages.py:197-204 有这段的设计说明）。于是
+      「它改道了」和「它其实到不了」被分开了 —— 两个标签若指向不同地方，
+      "改道成功"和"绕了远路/走岔了"就分不清。护栏在这里拦的是**意图**（写入措辞），
+      不是**目的地**：换一条语义更轻的路，仍然到得了同一个详情页。
+
+    ★ 与 `test_guarded_run_...`（用例 B）的区别，一句话：
+      B 验的是 block（系统自动拦，无人参与，动作被**替换**成说明）；
+      C 验的是 confirm→deny（有人参与，动作同样被替换，但"谁拒的"必须写进记录）。
+      两条路径在 steps.jsonl 里长得几乎一样，只有 `approved` / `approved_by`
+      两栏能分开 —— 而审计要回答"这次是系统拦的还是人拒的"，只能靠它们。
+
+    ★ 用 `AutoDenyApprover` 而不是 WebApprover：Web 那一半（卡片推给浏览器、
+      人点一下、Event 被唤醒）是 `tests/test_api.py` 的
+      `test_approval_endpoint_wakes_up_the_waiting_approver` 在验的。
+      这里要的是"拒绝之后的走向"，用真 Web 通道只会把这条用例变成一个
+      需要人在旁边点鼠标的测试 —— 那是演示，不是测试。
+    """
+    monkeypatch.setattr(R, "DB_PATH", tmp_path / "e2e.db")
+
+    start = f"{mock}/goods/goods_list"
+    spec = load_task(PROJECT_ROOT / "tasks" / "mock_shop_write_confirm.yaml")
+    # ★ 同用例 B：start_url 必须在 compile **之前**覆盖（check_start_url 拿它比白名单）。
+    spec = spec.model_copy(update={"start_url": start})
+    compiled = compile_task(spec, {"limit": 1}, chrome_path=CHROME_PATH, headless=HEADLESS)
+
+    # ★ 商品的五个字段按**页面上原样**给（"¥59.90" 而不是 59.90），
+    #   理由同用例 B：清洗那一环（output_models.clean_price）必须留在链路里。
+    first = GOODS[0]
+    llm = FakeLLM(
+        script=[
+            _click_by_label("编辑"),      # ← 会被 confirm-edit 拦下 → 弹审批 → 被拒
+            reroute_after_denial,          # ← 读了 HUMAN_DENIED 才改道点「查看详情」
+            {
+                "done": {
+                    "data": {
+                        "rows": [
+                            {
+                                "goods_id": first.goods_id,
+                                "title": first.title,
+                                "price": first.price,
+                                "stock": first.stock,
+                                "status": first.status,
+                            }
+                        ],
+                        "keyword": "",
+                        "note": "详情页读到的第一条",
+                    }
+                }
+            },
+        ]
+    )
+
+    runs_dir = tmp_path / "runs"
+    # ★ 挂一条真总线，只为抓 `run_completed` 的载荷 —— 这是**唯一**能在
+    #   离线测不到的地方：那条事件由真 runner 发出，假 runner 发的不算数。
+    #   它钉住的是"看板那行『结束 …』读得到的字段，实时通道真的发了"，
+    #   回放那一半在 tests/test_events.py（两条是一对）。
+    bus = EventBus(run_id=DENY_RUN_ID)
+    outcome = await run_task(
+        compiled,
+        approver=AutoDenyApprover(),
+        llm=llm,
+        runs_dir=runs_dir,
+        run_id=DENY_RUN_ID,
+        events=bus,
+    )
+    steps = _steps_jsonl(outcome.run_dir)
+
+    # ── 判据 0：run_completed 载荷里带着结束时刻 ──────────
+    done = [e for e in bus.backlog() if e.type == "run_completed"]
+    assert len(done) == 1, f"预期恰好 1 条 run_completed，实际 {len(done)} 条"
+    assert done[0].data.get("finished_at") == outcome.record.finished_at, (
+        f"实时 run_completed 载荷里的 finished_at 是 {done[0].data.get('finished_at')!r}，"
+        f"而 run.json 记的是 {outcome.record.finished_at!r} —— 看板那行『结束 …』"
+        f"读的就是它，两个通道里少一个都会让那行空着"
+    )
+    assert outcome.record.finished_at, "run.json 里本身就没有结束时刻"
+
+    # ── 判据 1：那句拒绝真的送到了 LLM 面前 ─────────────
+    # ★ 这条与 reroute_after_denial 里的断言是两件事，都要留：
+    #   那里的断言是"改道**依赖**于它"（少了下游就断），
+    #   这里是"送到的**是 HUMAN_DENIED 这个契约前缀**"（报告/日志/测试都 grep 它，
+    #   改文案可以，改前缀要同步改所有下游 —— 见 approver.DENIED_ERROR_PREFIX）。
+    assert llm.saw_text("HUMAN_DENIED"), (
+        "被拒之后的提示词里没有 HUMAN_DENIED —— 护栏只拦了动作，没把话说给 LLM 听。"
+    )
+
+    # ── 判据 2：被拒的是「编辑」，而且拒它的**是人**（这里是人形的 AutoDeny）──
+    notice_step = _guard_notice_step(steps)
+    message = notice_step["actions"][0]["params"]["message"]
+    assert "click" in message and "编辑" in message, (
+        f"那一击的 guard_notice 里读不出「点了什么」：{message!r}"
+    )
+    denies = [
+        d for s in steps for d in s["guardrail_decisions"] if d["rule_id"] == "confirm-edit"
+    ]
+    assert len(denies) == 1, (
+        f"预期恰好 1 条 confirm-edit 判定，实际 {len(denies)} 条：{denies}\n"
+        f"  0 条 → 那一击根本没走到审批（规则没命中？元素文本没取到？）；\n"
+        f"  ≥2 条 → 改道没成功，LLM 又点了一次「编辑」（那正是这条用例要排除的情况）。"
+    )
+    assert denies[0]["decision"] == "confirm", denies[0]
+    assert denies[0]["approved"] is False, (
+        f"这条 confirm 被记成已批准（{denies[0]}）—— 而这条 run 用的是永远拒绝的通道。"
+        f"「人拒绝了」和「人批准了」在报告里是两件相反的事，记错方向比不记更坏。"
+    )
+    # ★★ `approved_by` 是这条用例与用例 B 的**唯一分野**：
+    #    B 的 block 是系统自动拦的（approved 为 None，没有审批人）；
+    #    C 的拒绝有人参与，必须记下是谁 —— 审计要能回答"这次是人拒的还是系统拦的"。
+    assert denies[0]["approved_by"] == "auto-deny", (
+        f"审批人记成了 {denies[0]['approved_by']!r}，预期 auto-deny。"
+        f"  空串意味着记录里看不出「有人拒过」，于是报告会把一次人工拒绝"
+        f"显示成一次通道故障。"
+    )
+
+    # ── 判据 3：★★ 后续动作**变了**，而且变到了一个更轻的措辞上 ──
+    clicks = [(s, a) for s in steps for a in s["actions"] if a["name"] == "click"]
+    assert len(clicks) == 1, (
+        f"预期全程只执行了 1 次点击，实际 {len(clicks)} 次："
+        f"{[(a['element_text'], s['url']) for s, a in clicks]}\n"
+        f"  0 次 → 改道后那一击没落下去，run 是靠别的路径结束的；\n"
+        f"  ≥2 次 → 改道之外还点了别的（或者被拒的那一击其实执行了）。"
+    )
+    assert clicks[0][1]["element_text"] == "查看详情", (
+        f"改道后的动作落在「{clicks[0][1]['element_text']}」上，预期「查看详情」。"
+        f"  · 落在「编辑」上 → 是同一个被拒的意图又试了一次，不算改道；\n"
+        f"  · 落在别的东西上 → 改道了，但没到那个「同一个目的地」上，"
+        f"演示想说的那件事（换条路到得了）就没被验到。\n"
+        f"  ★ 这里能直接按 element_text 断言，是因为 `_click_target_index` 要求"
+        f"标签在页面上【唯一】—— 文本不同即元素不同，不会指到同一个元素上。"
+    )
+
+    # ── 判据 4：改道真的到得了同一个详情页（不是"绕了远路"）──
+    # ★ 这一条与判据 3 合起来才是完整的：只验"动作变了"的话，
+    #   一个把 agent 带进死胡同的改道也算通过。
+    detail_url = f"{mock}/goods/detail/{first.goods_id}"
+    urls = [str(s["url"]) for s in steps]
+    assert any(u == detail_url for u in urls), (
+        f"没有任何一步停在 {detail_url} 上（实际到过：{urls}）。\n"
+        f"  「查看详情」和「编辑」在 mock 上指向同一个 href —— 所以"
+        f"「改道了但到不了」这件事在这里是可分辨的，而现在它到不了。"
+    )
+
+    # ── 判据 5：任务照样完成，数据入库 ──────────────────
+    # ★ "拒绝不该让任务死掉"是这套设计的主张之一：被拒的是**意图**，
+    #   不是目标。这条断言就是那句话的可执行版本。
+    assert outcome.status == "completed", (
+        f"run 没跑成 completed（{outcome.status} / {outcome.parse_status}）。"
+        f"errors={outcome.record.errors}"
+    )
+    assert outcome.rows_collected == 1, (
+        f"采到 {outcome.rows_collected} 行，预期 1 行。errors={outcome.record.errors}"
+    )
+    with Repository(tmp_path / "e2e.db") as repo:
+        products = repo.get_products(DENY_RUN_ID)
+        run_row = repo.get_run(DENY_RUN_ID)
+    assert [p["goods_id"] for p in products] == [first.goods_id], products
+    assert run_row is not None and run_row["unsafe_auto_approved"] == 0, run_row
+
+    # ── 判据 6：这次 run 里一次写都没发生 ────────────────
+    # ★ 老实说这条在本用例里**比在用例 B 里弱**：两个标签指向同一个 GET，
+    #   所以就算护栏完全失效，这里也不会出现写请求。它能验的是更小的一件事：
+    #   改道途中的两次点击都没有顺手碰别的东西（比如「删除本商品」那个表单）。
+    #   写在这里是因为它便宜，而"便宜但方向正确"比"贵而啰嗦"好 ——
+    #   真正的写入断言在用例 B。
+    assert write_calls() == [], (
+        f"这次 run 里出现了写请求 {[w['path'] for w in write_calls()]} —— "
+        f"改道不该经过任何写入。"
+    )
+
+    # ── 判据 7：这条拒绝在报告里看得见 ──────────────────
+    # ★ 报告是可观测层的最终交付物。一次"人拒绝了"如果只在 jsonl 里、
+    #   在报告上不显示，那么拿报告复盘的人会以为这个 run 一路顺风。
+    html = (outcome.run_dir / "report.html").read_text(encoding="utf-8")
+    assert "confirm-edit" in html, (
+        "报告里找不到 confirm-edit 这条判定 —— 一次人工拒绝在交付物上不可见。"
+    )
+
+    # ── 判据 8：★★ 实时与回放的载荷**逐字段相等** ────────
+    # ★ 这条判据是"回放不是另做一套渲染"的**结构**版本。
+    #   前面几条钉的都是单个字段（finished_at / allowed_domains / attempts）——
+    #   它们各自都是"前端读一个字段、而某个通道从没发过它"这一**类**缺陷的实例，
+    #   已经出现过三次。三次都是靠人肉盯着看板发现的，这不可持续。
+    #   所以要有一条不看具体字段的判据：**两个通道对同一次 run 发出的载荷，
+    #   除少数几个说得清理由的键之外，必须一模一样。**
+    #
+    # ★ 比的是值不是键：`{"finished_at": ""}` 和 `{"finished_at": "2026-…"}`
+    #   键集完全相同。所以这里用 `==` 比整个字典 —— 键多一个、值歪一个都会红。
+    #
+    # ★ 只比这三个类型：`approval_required` / `approval_resolved` / `guardrail_blocked`
+    #   是**实时独有**的，回放刻意不合成它们（理由见
+    #   test_events.py::test_replay_does_not_invent_guardrail_or_approval_events ——
+    #   合成出来的那份会和实时那份漂移）。把它们算进来等于把一条已经想清楚的
+    #   设计决定重新判成 bug。
+    live = {e.type: e.data for e in bus.backlog()}
+    replay = {e.type: e.data for e in events_from_run_dir(outcome.run_dir)}
+    for event_type, live_only, replay_only in (
+        # ★ 白名单里每一条都要有理由，否则它就是个"漂移豁免区"：
+        #   · max_attempts —— 重试上限，只对"还能再试几次"有意义；
+        #     run.json 里没存 retry 规格（回放读不到它），前端也没渲染它。
+        #   · run_dir —— 实时要告诉看板"产物在哪"，回放自己就是从那个目录读的。
+        #   · replay —— 徽标用，回放当然要说自己是回放（见 test_replay_marks_itself_…）。
+        ("run_started", {"max_attempts"}, set()),
+        ("step_completed", set(), set()),
+        # ★ 实时那边有个 `attempts`（第几次尝试用掉了几次），回放现在也有 ——
+        #   两边取的其实是 run.json 里同一个数。run_completed 没有 run_dir 之外
+        #   的实时独有键，这也是为什么它是最该比严的那个。
+        ("run_completed", {"run_dir"}, {"replay"}),
+    ):
+        assert event_type in live, f"实时通道没发 {event_type}（判据 8 的对照前提不成立）"
+        assert event_type in replay, f"回放通道没发 {event_type}"
+        diff = {
+            k: (live[event_type].get(k), replay[event_type].get(k))
+            for k in set(live[event_type]) | set(replay[event_type])
+            if live[event_type].get(k) != replay[event_type].get(k)
+        }
+        unexpected = {
+            k: v for k, v in diff.items()
+            if not (k in live_only and v[1] is None) and not (k in replay_only and v[0] is None)
+        }
+        assert not unexpected, (
+            f"{event_type} 在两个通道里的载荷不一致：{unexpected}\n"
+            f"  只在实时有：{sorted(set(live[event_type]) - set(replay[event_type]))}\n"
+            f"  只在回放有：{sorted(set(replay[event_type]) - set(live[event_type]))}\n"
+            f"  （白名单：实时独有 {sorted(live_only)}，回放独有 {sorted(replay_only)}）\n"
+            f"  前端两个通道读的是同一份字段。少一边的后果不是报错，是那一栏"
+            f"在回放里静默地空着、或者显示一句假的默认值 —— 已经发生过三次。"
+        )

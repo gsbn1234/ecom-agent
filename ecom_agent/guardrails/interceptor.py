@@ -32,6 +32,7 @@ from ecom_agent.actions.guard_gate import (
 )
 from ecom_agent.guardrails.approver import ApprovalRequest, Approver
 from ecom_agent.guardrails.policy import DecisionResult, GuardrailPolicy
+from ecom_agent.observability.events import EventBus, RunEvent
 from ecom_agent.observability.models import GuardrailDecisionRecord, now_iso
 from ecom_agent.observability.redact import Redactor
 
@@ -55,6 +56,7 @@ class GuardrailInterceptor:
         run_id: str = "",
         redactor: Redactor | None = None,
         tools: Any | None = None,
+        events: EventBus | None = None,
     ) -> None:
         self.policy = policy
         self.approver = approver
@@ -62,6 +64,11 @@ class GuardrailInterceptor:
         self.run_id = run_id
         self.redactor = redactor or Redactor()
         self._page_changing = compat.page_changing_actions(tools) if tools is not None else set()
+
+        # ★ 实时事件通道（Phase 5）。可以没有 —— 没有时所有发布点静默跳过，
+        #   行为与加它之前完全一致。这条"可选"是刻意的：CLI 跑批、离线单测
+        #   都不需要看板，不该被迫先建一个总线。
+        self.events = events
 
         # 本步的判定，等 on_step_end 时交给 recorder。
         # ★ 用实例状态而不是"给回调返回值"：new_step_callback 的返回值被库忽略
@@ -266,6 +273,34 @@ class GuardrailInterceptor:
                     "护栏拦截 step=%s 动作=%s 元素=%r 规则=%s 理由=%s",
                     step_index, name, element_text, result.rule_id, result.reason,
                 )
+            # ★★ 拦截事件从**这里**发，而不是在 runner 记完这一步之后从
+            #    StepRecord 里反推。理由是那条路会漏掉最该看的一类：
+            #
+            #    runner 的 `_make_step_hook` 有一个"history 有没有变长"的闸门，
+            #    硬停那一步**不产生历史项**，于是判定会被它显式丢弃
+            #    （那个函数里有长注释解释为什么无处可挂）。
+            #    而"连续被拦到上限于是整个 run 被终止"恰恰是看板上最该立刻反应的
+            #    一件事 —— 从 step 记录反推的话，它永远显示不出来。
+            #
+            #    从判定点发则一条不漏：这里是所有 block 的唯一必经之路。
+            self._publish(
+                "guardrail_blocked",
+                {
+                    "step": step_index,
+                    "action_name": name,
+                    # ★ 脱敏：这条要推到浏览器上。判定记录那边落盘时另有脱敏，
+                    #   两处都要做 —— 事件通道不经过 recorder。
+                    "element_text": self.redactor.text(element_text) if element_text else None,
+                    "url": self.redactor.text(url),
+                    "rule_id": result.rule_id,
+                    "reason": result.reason,
+                    "matched_rule_ids": list(result.matched_rule_ids),
+                    "block_streak": self.policy.block_streak,
+                    # ★ 这一条决定看板要不要把整条时间线染红：它不是"又拦了一个动作"，
+                    #   而是"run 到此为止"。两者在时间线上长得像，含义差一个量级。
+                    "hard_stop": tripped,
+                },
+            )
             return _OneDecision(record, approved=False)
 
         # ── CONFIRM：问人 ─────────────────────────────────
@@ -303,9 +338,49 @@ class GuardrailInterceptor:
             rule_id=result.rule_id,
             reason=result.reason,
         )
+        # ★★ approval_required 必须在 **await 之前**发出去，这条顺序是功能性的：
+        #    看板是唯一能让人知道"有人在等审批"的地方，而 run 此刻正挂在这个
+        #    await 上、什么都不做。先 await 再发的话，人永远等不到那张卡片 ——
+        #    一个永远不弹的审批卡片，表现和"没有需要审批的动作"一模一样。
+        #
+        #    载荷直接用 req 的字段（它**已经在上面脱敏过了**，approver.py:64-67
+        #    把"构造前先脱敏"写成了契约）。这里是从脱敏后的对象取值，
+        #    不是另取一份原始参数 —— 后者会让浏览器上出现一份没洗过的数据。
+        self._publish(
+            "approval_required",
+            {
+                "approval_id": req.id,
+                "step": req.step,
+                "action_name": req.action_name,
+                "params": req.params,
+                "element_text": req.element_text,
+                "url": req.url,
+                "rule_id": req.rule_id,
+                "reason": req.reason,
+                "summary": req.summary(),
+            },
+        )
         out = await self.approver.request(req)
         self._last_approver = out.approved_by
         logger.info("审批 %s → %s（%s）", req.id, out.outcome.value, out.approved_by or "-")
+        # ★ 用 `outcome.value` 而不是 `approved` 布尔：四种结局里只有一种意味着
+        #   "护栏按预期工作"（人真的点了拒绝）。超时和通道故障都是布尔上的
+        #   "没批准"，但它们说明**审批通道本身有问题** —— 这正是
+        #   approver.py 里 ApprovalOutcome 那段注释坚持要分开的那件事。
+        #   前端因此能画出三种不同的卡片而不是一句"未获批准"。
+        self._publish(
+            "approval_resolved",
+            {
+                "approval_id": req.id,
+                "step": req.step,
+                "action_name": req.action_name,
+                "outcome": out.outcome.value,
+                "approved": out.approved,
+                "approved_by": out.approved_by,
+                "decided_at": out.decided_at,
+                "note": out.note,
+            },
+        )
         return out.approved
 
     # ── 造给 LLM 看的说明 ──────────────────────────────────
@@ -444,6 +519,17 @@ class GuardrailInterceptor:
         out = self._pending_decisions
         self._pending_decisions = []
         return out
+
+    def _publish(self, type_: str, data: dict[str, Any]) -> None:
+        """往实时通道发一条。没有总线时**静默跳过**（不是错误）。
+
+        ★ 这里**不 try/except**：`EventBus.publish` 本身已经被设计成不会失败
+          （同步、不抛、满了就丢并通报），给它套一层 except 只会掩盖
+          我们自己拼错的载荷。真要炸就炸在开发期。
+        """
+        if self.events is None:
+            return
+        self.events.publish(RunEvent(type=type_, run_id=self.run_id, data=data))
 
     async def aclose(self) -> None:
         closer = getattr(self.approver, "aclose", None)

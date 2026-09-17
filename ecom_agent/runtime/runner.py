@@ -34,6 +34,7 @@ from ecom_agent.config import DB_PATH, LIVE_LLM, RUNS_DIR
 from ecom_agent.dsl.compiler import CompiledTask
 from ecom_agent.guardrails.interceptor import GuardrailInterceptor
 from ecom_agent.guardrails.policy import GuardrailPolicy
+from ecom_agent.observability.events import EventBus, RunEvent
 from ecom_agent.observability.models import (
     BLOCKED,
     COMPLETED,
@@ -317,12 +318,20 @@ class TaskRunner:
         runs_dir: Path | str | None = None,
         run_id: str | None = None,
         llm: Any | None = None,
+        events: EventBus | None = None,
     ) -> None:
         self.compiled = compiled
         self.spec = compiled.spec
         self.approver = approver
         self.run_id = run_id or new_run_id()
         self.run_dir = Path(runs_dir or RUNS_DIR) / self.run_id
+
+        # ★ 实时事件通道（Phase 5）。**可选**：没有它时所有发布点静默跳过，
+        #   行为与加它之前逐字一致。这条性质是刻意的 —— 离线单测、CLI 跑批
+        #   都不需要看板，不该被迫先建一个总线才能跑。
+        #   它的落盘侧读者是 steps.jsonl / run.json，与这里互不替代：
+        #   一个是"现在在干嘛"，一个是"到底发生了什么"（见 events.py 开头）。
+        self.events = events
 
         # ★ 脱敏词表来自任务模板的 `observability.redact_extra`（如店铺名）。
         #   它在 DSL 里是一个**任务级**字段，因为"哪些词算敏感"是业务知识，
@@ -348,6 +357,20 @@ class TaskRunner:
         库自己的令牌账本）。那两样都不依赖浏览器存活，所以能在会话关掉之后读。"""
         self._started_at = now_iso()
         self.recorder: RunRecorder | None = None
+
+    # ── 事件 ──────────────────────────────────────────────
+    def _publish(self, type_: str, data: dict[str, Any]) -> None:
+        """往实时通道发一条。没有总线时静默跳过。
+
+        ★ 与拦截器里同名方法的分工：**两边都发**，不是重复。
+          拦截器发的是"判定发生的那一刻"（拦了什么、在等谁批准），
+          runner 发的是"这一步记完了"。前者的价值是**即时**，后者的价值是
+          **与盘上逐字一致**。看板两条都要：审批卡片必须在拦截那一刻弹出，
+          而步骤行必须与 steps.jsonl 同形（否则回放和实时会不一样）。
+        """
+        if self.events is None:
+            return
+        self.events.publish(RunEvent(type=type_, run_id=self.run_id, data=data))
 
     # ── LLM ───────────────────────────────────────────────
     def _resolve_llm(self) -> Any:
@@ -438,6 +461,26 @@ class TaskRunner:
         blocked = False
         stop_reason = ""
 
+        # ★★ run_started 的位置是**预检通过之后、第一次尝试之前**，不是
+        #    函数入口。差别在于：配置错（start_url 不在白名单、没有 key）时
+        #    这里根本走不到，所以看板上不会出现一条"已开始"的记录 ——
+        #    那种情况 Web 层会直接回一个 error 事件。
+        #    一个"开始过但什么都没发生"的 run 记录会让人去查 run 目录，
+        #    而配置错误压根没有 run 目录。
+        self._publish(
+            "run_started",
+            {
+                "run_id": self.run_id,
+                "task_id": self.compiled.task_id,
+                "task_name": self.spec.name,
+                "params": self.compiled.params,
+                "start_url": self.spec.start_url,
+                "task_fingerprint": self.compiled.fingerprint,
+                "max_attempts": max_attempts,
+                "allowed_domains": list(self.spec.guardrails.allowed_domains),
+            },
+        )
+
         for attempt in range(1, max_attempts + 1):
             self.attempts = attempt
             recorder.begin_attempt(attempt)
@@ -449,6 +492,18 @@ class TaskRunner:
             except Exception as exc:  # noqa: BLE001 —— 一次 attempt 崩了要能落到产物里
                 logger.exception("第 %d 次尝试异常终止", attempt)
                 self.errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
+                # ★ 转成 SSE 的 error 事件，**不是断开连接**（计划里的契约）。
+                #   断开的话看板只会显示"连接中断"，而那正是最需要现场的时刻 ——
+                #   人看到的是"网络问题"，实际是 run 崩了。
+                self._publish(
+                    "error",
+                    {
+                        "where": f"attempt {attempt}",
+                        "kind": type(exc).__name__,
+                        "message": str(exc),
+                        "fatal": False,
+                    },
+                )
                 attempt_out = _AttemptResult(
                     history=None, structured=None, product_rows=0, blocked=False,
                     stop_reason="", exception=exc,
@@ -517,6 +572,35 @@ class TaskRunner:
         await self._write_artifacts(record, structured=structured, history=history,
                                     recorder=recorder)
 
+        # ★ run_completed 在**产物写完之后**发。理由与 `_write_artifacts` 里
+        #   "先渲染报告再声明 artifacts"是同一条：这条事件在语义上说
+        #   "东西都在盘上了"，那么它就不能在盘上还没有的时候发出去 ——
+        #   否则看板收到它之后去读 run.json 会读到一个不存在的文件，
+        #   而且这个竞态只在快机器上偶发。
+        #
+        # ★ 这里**不** close() 总线：一次 run 结束后，看板还要继续读 backlog
+        #   （页面刷新、SSE 重连、以及"跑完了我再看一眼"）。关不关是 Web 层
+        #   的决定，它才知道订阅者什么时候都可以收摊了。
+        self._publish(
+            "run_completed",
+            {
+                "run_id": self.run_id,
+                "status": status,
+                "parse_status": parse_status,
+                "rows_collected": record.rows_collected,
+                "steps": record.steps,
+                "duration_s": record.duration_s,
+                # ★ 结束时刻必须发出去：看板的"结束 …"读的就是这个字段。
+                #   它原来**两个通道都没发**（回放那边手里明明有，只是没放进载荷），
+                #   于是那行永远渲染成"结束 "后面空着 —— 一个前端读了、
+                #   而生产者从来没给过的字段。
+                "finished_at": record.finished_at,
+                "attempts": self.attempts,
+                "errors": list(self.errors),
+                "run_dir": str(self.run_dir),
+            },
+        )
+
         return RunOutcome(
             run_id=self.run_id,
             run_dir=self.run_dir,
@@ -551,6 +635,7 @@ class TaskRunner:
             run_id=self.run_id,
             redactor=self.redactor,
             tools=tools,
+            events=self.events,
         )
 
         async with browser_session(
@@ -692,6 +777,28 @@ class TaskRunner:
             actions_not_executed=not_executed,
         )
         self.step_records.append(record)
+
+        # ★★★ 这条载荷**就是** `steps.jsonl` 的那一行 —— 但**必须先脱敏**。
+        #
+        #    ⚠️ 这里踩过一脚，值得写下来：`recorder.record_step()` 返回的是
+        #    **未脱敏**的 `record`，而它写进盘的是
+        #    `redactor.obj(record.model_dump(mode="json"))`（recorder.py:241）。
+        #    也就是说"盘上的那一行"和"内存里的这个对象"在有东西需要脱敏时
+        #    **不是同一份**。直接推 `record.model_dump()` 会有两个后果：
+        #      1. 泄漏：事件要推到**浏览器**上，而脱敏恰恰是为"不该被看到的
+        #         人"准备的（店铺名、订单号）。盘上盖住了，看板上没有。
+        #      2. 漂移：实时推的和盘上读的不一致 —— 于是前端"一个渲染器"
+        #         这条约束在**有敏感词的那些 run 上**静默失效，
+        #         而恰恰是那些 run 最需要回放可信。
+        #    两处用同一个 Redactor 实例、对同一个输入各跑一次，
+        #    输出必然相等（脱敏是纯函数），于是"逐字节同源"重新成立。
+        #
+        #    `mode="json"` 是必要的：StepRecord 里有非 JSON 原生类型，
+        #    不加的话 `RunEvent.sse()` 的 json.dumps 会退到 default=str，
+        #    产出 `"Decimal('12.00')"` 这种能读但没法解析的字符串。
+        self._publish(
+            "step_completed", self.redactor.obj(record.model_dump(mode="json"))
+        )
 
     # ── 汇总 ──────────────────────────────────────────────
     def _build_record(
@@ -868,12 +975,18 @@ async def run_task(
     runs_dir: Path | str | None = None,
     run_id: str | None = None,
     llm: Any | None = None,
+    events: EventBus | None = None,
 ) -> RunOutcome:
-    """跑一次任务。这是 CLI / Web 层唯一的调用点。"""
+    """跑一次任务。这是 CLI / Web 层唯一的调用点。
+
+    ★ `events` 可选：CLI 不传（没有看板），Web 层传一个总线好让 SSE 有东西可推。
+      两条路径跑的是**同一份**编排代码 —— 不是"Web 版 runner"和"CLI 版 runner"。
+    """
     return await TaskRunner(
         compiled,
         approver=approver,
         runs_dir=runs_dir,
         run_id=run_id,
         llm=llm,
+        events=events,
     ).run()
