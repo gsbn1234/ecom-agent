@@ -14,7 +14,7 @@
 > [`docs/spikes.md`](docs/spikes.md)（探路实测结论 + 逐条判据 + CI 排查全程）、
 > [`docs/guardrail_design.md`](docs/guardrail_design.md)（三层护栏各能挡什么、**挡不住什么**）。
 >
-> 测试现状：**454 条 = 437 条离线（CI 硬门禁）+ 17 条 `needs_browser`（本地硬门禁）**。
+> 测试现状：**459 条 = 442 条离线（CI 硬门禁）+ 17 条 `needs_browser`（本地硬门禁）**。
 > **ADR/README 定稿那次推送 = [`de1ac57`](https://github.com/gsbn1234/ecom-agent/commit/de1ac57)，
 > CI run [`35233757564`](https://github.com/gsbn1234/ecom-agent/actions/runs/35233757564)
 > 两个 job 全绿**，且浏览器 job 是真绿 —— gate 走的是「**测试绿**」那条分支，
@@ -56,8 +56,8 @@ cd ecom-agent
 uv venv && uv pip install -e ".[dev]"
 
 cp .env.example .env      # 填 DEEPSEEK_API_KEY
-uv run pytest -m "not needs_browser"   # 离线 437 条，零 token 零网络，应当全绿
-uv run pytest                          # 全部 454 条（含 17 条真浏览器，会真的开 Chrome）
+uv run pytest -m "not needs_browser"   # 离线 442 条，零 token 零网络，应当全绿
+uv run pytest                          # 全部 459 条（含 17 条真浏览器，会真的开 Chrome）
 ```
 
 > ⚠️ **`uv run pytest` 默认包含 `needs_browser`** —— 想"零 token 零网络"地跑一遍，
@@ -142,9 +142,9 @@ uv run python main.py run tasks/books_demo.yaml    # 用公开练手站点，不
 ## 测试分层
 
 ```bash
-uv run pytest -m "not needs_browser"   # 437 条离线：DSL / 护栏 / 脱敏 / 落库 / 报告 / API
+uv run pytest -m "not needs_browser"   # 442 条离线：DSL / 护栏 / 脱敏 / 落库 / 报告 / API
 uv run pytest -m needs_browser         # 17 条：需要真实浏览器，对着本地 mock 站点跑
-uv run pytest                          # 454 条全部 = 437 + 17（默认就包含 needs_browser）
+uv run pytest                          # 459 条全部 = 442 + 17（默认就包含 needs_browser）
 ```
 
 > 分层的主轴不是"快慢"，是**依赖什么**：纯逻辑 → 临时文件 → asyncio → 真浏览器。
@@ -224,31 +224,54 @@ FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc:129] No usable sandb
 说清楚：`extract_cards`（S8 探路的产出）**不解决**这件事。它解决的是"那一页不是
 表格、`extract_table` 只认表格"这个**形态**问题，不是"店里没货"这个**数据**问题。
 
-**2. 脱敏（`Redactor`）有两条已知盖不住的形态，而且它承诺的文档是空的**
+**2. 脱敏（`Redactor`）盖不住的形态：头部盲区修好了，同一族还有两条漏着**
 
 补 `sanity_flags()` / `_detect_pii()` / `suspicious` 的用例时（原来这条缺口记的
 就是它们零覆盖）顺带核出：`_detect_pii()` 只是 `Redactor` 规则表的一个投影，
 而 **`Redactor` 整个类在 `tests/` 下零命中** —— 不是"名字没出现过"，是
 **没有任何一条用例断言过 `<REDACTED>` 产物**。现在有守卫了：
-`tests/test_sanity_and_pii.py`（43 条 = 42 passed + 1 xfail，其中 6 条对照实验
-逐条验过"拆掉机制就会红"）。补完之后**仍盖不住**的是这两条：
+`tests/test_sanity_and_pii.py`（48 条，其中 7 条对照实验逐条验过"拆掉机制就会红"）。
 
-| 形态 | 实测结果 | 为什么 |
+| 形态 | 实测结果 | 性质 |
 |---|---|---|
-| `Authorization: Bearer <token>` | **一个字都不盖**（`_detect_pii` 返回 `[]`，文本原样） | 规则的 `[:=]` 要求冒号在关键字**之后**，而真实头部的冒号在 `Bearer` **之前** → 那个 `bearer` 分支对它的规范形态**永远不命中** |
-| 标题里的订单号 | 盖不住 | 「长数字串一律盖掉」这条规则是**故意没有**的：pdd 的 `goods_id` 本身就是长数字，笼统盖掉会把任务真正要采集的数据一起毁掉（还毁得很安静）。订单号只能靠 YAML 的 `redact_extra` 给精确形态 |
+| `Authorization: Bearer <token>` | ✅ **已盖住**（2026-09-17 修） | 曾是**缺陷** |
+| `Authorization: Basic <base64>`／`Token <key>` | 仍**一个字都不盖** | **缺陷**，待拍板 |
+| 标题里的订单号 | 盖不住 | **取舍**（不是缺陷） |
 
-第二条是**取舍**（有代价、也有理由），第一条是**缺陷**：`token:` / `api_key=`
-这些形态是好的，于是"凭证类规则在工作"看起来成立 —— 正是 `redact.py` 的 docstring
-自己警告过的那种失效（"最危险的地方在于它看起来在工作"）。
+第一条**修之前**的实测是"一个字都不盖"：老规则要求 `[:=]` 出现在关键字**之后**，
+而规范头部的冒号在 `Bearer` **之前** → 那个 `bearer` 分支对它的规范形态永远不命中；
+而 `token:` / `api_key=` 是好的，于是"凭证类规则在工作"看起来成立 —— 正是
+`redact.py` 的 docstring 自己警告过的那种失效（"最危险的地方在于它看起来在工作"）。
 
-⚠️ 还有一处**反向的文档漂移**：`ecom_agent/observability/redact.py:50` 的注释写着
-"这条限制写进 `docs/guardrail_design.md` 的失效边界"，而那份文档里"脱敏"**零命中**
-—— 承诺从没兑现（顺带：计划里写的 `docs/observability_schema.md` 也根本不存在）。
+修法值得单独说，因为它是**一次被实测改掉的第一直觉**：我本来打算写「关键字 + 空白 + 值」
+这么一条笼统规则，真跑了一下发现它会**误伤散文** ——
 
-处置：Bearer 那条用 **`strict xfail` 钉住**（现在是 `xfailed`；谁修好它会变成 XPASS
-并主动失败，提醒删标记）。**修 `redact.py` 本身是生产代码改动，本轮没做** ——
-它改的是安全控制的射程，得单独拍板。
+```
+"error: Bearer authentication is required"
+  → "error: Bearer <REDACTED:token> is required"      ← authentication 被当成凭证盖了
+```
+
+`authentication` 有 14 个字符、又全在字符类里，所以它**必然**命中，不是概率问题。
+最终锚在**头名**上（`authorization: bearer <值>`）。代价写清楚：不在头部、单说一句
+`Bearer <值>` 的地方（比如 JSON 体里的字段）**仍不盖**。
+
+漏着的那两条是**同一族的另外两个实例，故意没顺手加**：`Basic` 的字母表不同（多 `+/=`），
+而"要不要盖 base64 凭证"是个射程决定；DRF 的 `Token <key>` 形态比 `bearer` 松、误伤面
+更大，得先有实测再动。
+
+第三条是**取舍**：「长数字串一律盖掉」这条规则是**故意没有**的 —— pdd 的 `goods_id`
+本身就是长数字，笼统盖掉会把任务真正要采集的数据一起毁掉（还毁得很安静：库里
+`goods_id` 变成 `<REDACTED>`，报告看起来"脱敏很到位"）。订单号没有跨平台通用形态，
+只能靠 YAML 的 `redact_extra` 给精确值。
+
+⚠️ 顺带记一处**反向的文档漂移**（已补）：`ecom_agent/observability/redact.py` 的注释
+曾写着"这条限制写进 `docs/guardrail_design.md`"，而那份文档里"脱敏"**零命中** ——
+承诺从没兑现（顺带：计划里写的 `docs/observability_schema.md` 也根本不存在）。
+现在这一节真的写进 `guardrail_design.md` 了。
+
+处置：修之前那条缺口是用 **`strict xfail`** 钉住的（"已知缺口的机器可读记录"，
+**不等于"这条已经测过了"**）。这个机制这次**真跑通了**：修完它变成 XPASS 并主动
+让整轮失败，提醒删标记 —— 实测过一次，不是设想。
 
 **3. 没有写入型的真站点任务**
 
