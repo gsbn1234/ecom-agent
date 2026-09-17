@@ -1655,3 +1655,43 @@ INFO  给已存在的 runs 表补列：login_state_url
 | `tests/test_runner_offline.py` 的 G2（4 条） | 探的时机（预检导航后）、探的页面（落到的那个）、不需要登录态的任务**一次都不探**、探针坏了 run 照跑 |
 | `tests/test_report.py`（6 条） | 报告第一行的**位置**、两种沉默是两句话、跳转只在真跳了时说 |
 | `tests/test_runner_offline.py` 的 sqlite/迁移/列表（3 条） | schema → ALTER → INSERT → SELECT → print 这条链**一次改齐** |
+
+### 补充（同日）：看板那四条通道，以及一条**判据 8 的盲区**
+
+上面那三通道是**产物**侧的（run.json / runs 表 / CLI）。而演示主镜头是**看板** ——
+它走的是另外四条**手写白名单**：`runner.py` 的实时 `run_completed` 载荷、
+`events.py` 的回放载荷、`_list_run_dirs` 的字段字典、`index.html` 的三处渲染。
+四条一个都没带上登录态，于是看板上"被登录页挡下的零行"和"店里真没数据"
+依然是一模一样的 `completed / empty · 0 行`。四个都补了，前端一个 `loginSuffix()`
+**只在需要说话时说话**（`login_page` 说话、`unknown` 说"看不清"、`logged_in`
+和 `""` 安静 —— 每次都被念一遍的话，那句真正要紧的话会被淹掉）。
+
+★ 浏览器里逐条看过（真 uvicorn + puppeteer 页内 `evaluate`，**没点任何按钮**，
+理由见 [[mcp-puppeteer-click-unreliable]]）：历史两行**并排** ——
+一条带 `⚠️ 落在登录页（不是风控）`、一条（老 run.json）干净；
+深链回放同样带这句，顺带复验了 `+` 号那个坑没复发；
+三条实时分支走的是**真的 `handleEvent`**（不是手抄一遍渲染逻辑）。
+
+#### ★★★ 判据 8 抓不住"**发了一个空值**"
+
+这是这次最该记住的一条，因为它推翻了一个原本以为够用的守卫。
+
+`tests/test_mock_pdd_e2e.py` 的判据 8 拿同一次真 run 的实时载荷与回放载荷
+**逐字段比**，能抓住"某个通道**少发了**一个键"（`replay.get(k)` 是 `None`）。
+但 mock 任务的 `requires_login` 是 false，两边的登录态都是 `""` ——
+**两边并排比下来完全一致、绿**。所以：
+
+| 失效形态 | 判据 8 | 靠什么抓 |
+|---|---|---|
+| 某个通道少发一个键 | ✅ 红 | 判据 8 |
+| **某个通道发了个空值** | ❌ **绿** | 只能用**非空值**钉住载荷本身 |
+
+处置：把 `run_completed` 的载荷抽成 `_run_completed_payload(record)`。
+它内联在 `run()` 里时离线**一次都验不到**（`run()` 要真浏览器真 LLM 真落库），
+抽出来之后 `test_runner_offline.py` 能喂一个 `login_page` 的 record 进去，
+断言载荷里就是 `login_page` —— 并且把 `_build_record` → 载荷**接起来跑**，
+证明的是整条链（只测后半段的话，"record 里没值"会被载荷层老实转发成空，
+两边都对、链是断的）。
+
+**证伪**（四条新用例逐条拆机制）：把 `record.login_state` 改成常量 `""` →
+红在"实测落在登录页上"；拆掉回放那两个键 → 2 红；拆掉列表字段 → `KeyError`。
