@@ -238,8 +238,15 @@ DEATH_MARKERS = ("FATAL", "Check failed", "Received signal", "zygote", "sandbox"
 KNOWN_NOISE = ("cpufreq", "dbus/")
 
 
-def fatal_lines(text: str) -> list[str]:
+def fatal_lines(text: str, *, include_suspects: bool = True) -> list[str]:
     """从 Chrome 输出里挑出"为什么死"的那几行。返回值的语义见下。
+
+    ★ `include_suspects=False` = **只报真凶，不报嫌疑人**（兜底档整个关掉）。
+      为什么需要这个开关：兜底档的立论是"没有真凶时，非噪声的 ERROR 是我们仅有的
+      线索" —— 这句话成立的前提是【确实死了、正在查】。而主路径当初是无条件调它的，
+      于是库**启动成功**的那次，一条良性的 SSL handshake ERROR 被挑成嫌疑人，
+      注解区多出一条红字，标题还写着「Chrome 的死因行」。
+      实测记录见 `fatal_lines_for_run`。
 
     ★★ 两档制，而不是"黑名单过滤 ERROR"。这个设计是被 bug 逼出来的：
 
@@ -269,10 +276,37 @@ def fatal_lines(text: str) -> list[str]:
     primary = _dedup(s for s in lines if any(k in s for k in DEATH_MARKERS))
     if primary:
         return primary
+    if not include_suspects:
+        # ★ 一档没命中 + 不许报嫌疑人 → 空。
+        #   注意这【不是】把一档也闸了：真有 FATAL / Check failed 的行，
+        #   上面那行就已经返回了，根本走不到这里。
+        return []
     # 兜底档：没有死亡关键词。此时非噪声的 ERROR 是我们仅有的线索。
     return _dedup(
         s for s in lines if "ERROR:" in s and not any(n in s for n in KNOWN_NOISE)
     )
+
+
+def fatal_lines_for_run(log_text: str, *, lib_ok: bool) -> list[str]:
+    """探针主路径的入口：**健康运行不报嫌疑人**。
+
+    ★★ 2026-09-17 实测出来的缺口（不是推演）：主路径原来直接调 `fatal_lines()`，
+      而那段代码挂在 `if lib.get("argv"):` 上 —— **不看 `lib.get("ok")`**。
+      于是库**启动成功**的那一次（探针结论：环境可用），Chrome 输出里一条良性的
+          ERROR:net/socket/ssl_client_socket_impl.cc:962] handshake failed; ...
+      被兜底档挑中，注解区就多出一条 error 级红字，标题写着「Chrome 的死因行」，
+      而这次运行根本没死。
+
+      ★ 它是**偶发**的：同一份代码前两次 CI 都没报 —— 那两次 Chrome 输出里
+        恰好没有非噪声的 ERROR 行。所以它不是"每次都在的红"，而是"偶尔喊一次
+        狼来了"，而后者更难被发现：看到的人会以为是真事。
+        这正是本模块 docstring 结尾那句"总在喊狼来了的注解，等于没有注解"。
+
+    ★ 为什么只闸【兜底档】，不闸一档：真有 FATAL / Check failed 的行，哪怕库这次
+      起来了也仍然是异常，报出来是对的。"有真凶时只报真凶"这条不许被削弱 ——
+      被闸掉的只有"嫌疑人"。
+    """
+    return fatal_lines(log_text, include_suspects=not lib_ok)
 
 
 # ★ 关沙箱用的三个参数，抄自库自己的 CHROME_DOCKER_ARGS
@@ -631,7 +665,7 @@ def main() -> int:
         print("Chrome 输出: （空 —— 一个字都没写出来，说明它连初始化都没走完）")
     print("-" * 70)
 
-    fatals = fatal_lines(log_text)
+    fatals = fatal_lines_for_run(log_text, lib_ok=bool(lib.get("ok")))
     if fatals:
         print("死因行（从崩溃转储里挑出来的，不是 tail）:")
         for ln in fatals[:6]:
@@ -744,7 +778,7 @@ def main() -> int:
         )
     V["stage2_library_launch"] = bool(lib.get("ok"))
     V["stage2_error"] = lib.get("error")
-    V["fatal_lines"] = fatal_lines(log_text)[:6]
+    V["fatal_lines"] = fatal_lines_for_run(log_text, lib_ok=bool(lib.get("ok")))[:6]
     V["sandbox_matrix"] = {k: v[0] for k, v in (matrix or {}).items()}
     _ann(
         "notice" if V["usable"] else "warning",

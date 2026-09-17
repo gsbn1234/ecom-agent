@@ -12,7 +12,12 @@
 """
 from __future__ import annotations
 
-from devtools.probe_browser import DEATH_MARKERS, KNOWN_NOISE, fatal_lines
+from devtools.probe_browser import (
+    DEATH_MARKERS,
+    KNOWN_NOISE,
+    fatal_lines,
+    fatal_lines_for_run,
+)
 
 # ── 样本：全部逐字来自 GitHub runner 上的实测输出 ──────────────
 FATAL_SANDBOX = (
@@ -41,6 +46,15 @@ NOISE_CPUFREQ = (
 # 一条"非噪声的 ERROR"：不是死因，但也【不在】已知噪声名单里。
 # 兜底档存在的意义就是它 —— 没有死亡关键词时，它是唯一线索。
 UNKNOWN_ERROR = "[0916/153651.9:ERROR:some/new_subsystem.cc:42] something we have not seen before"
+
+# 一条【良性】的 ERROR，逐字来自 run 35242331538 的真实 Chrome 输出。
+# ★ 它与 UNKNOWN_ERROR 的区别是决定性的：UNKNOWN_ERROR 出现在"正在查失败"的
+#   语境里（是线索），而这一条出现在**库启动成功**的那次运行里（是噪声）。
+#   同一个字符串，该不该报，取决于"这次到底死了没有" —— 这正是本文件要锁的东西。
+SSL_BENIGN = (
+    "[2843:2860:0917/154630.652108:ERROR:net/socket/ssl_client_socket_impl.cc:962] "
+    "handshake failed; returned -1, SSL error code 1, net_error -3"
+)
 
 
 def _health_run_text() -> str:
@@ -117,6 +131,92 @@ def test_healthy_run_reports_nothing():
     text = _health_run_text()
     assert text.strip(), "样本是空的，这个测试会假通过"
     assert fatal_lines(text) == []
+
+
+# ── 对照实验 3b：健康运行【连嫌疑人也不许报】（2026-09-17 补）──
+def test_a_healthy_run_does_not_report_suspects():
+    """健康运行 + 一条【非噪声】ERROR → 一条都不许报。
+
+    ★ 这条补的是上面那条够不着的那半。上面那条的样本只含【已知噪声】，
+      而真实漏掉的是"健康运行 + 一条我们没见过的良性 ERROR"：
+      兜底档把它挑成嫌疑人，注解区多出一条 error 级红字，标题写着
+      「Chrome 的死因行」—— 而那次运行根本没死（库启动成功了）。
+
+    ★ 它是**偶发**的，这才是它难被发现的原因：同一份代码前两次 CI 都没触发
+      （那两次恰好没有非噪声的 ERROR 行）。偶发红字会被读成"偶尔的真事"。
+    """
+    text = _health_run_text() + "\n" + SSL_BENIGN
+
+    # ★ 先证明样本是【活的】：确实含那条 ERROR，且不含任何死亡关键词。
+    #   否则"报不出东西"可能只是因为样本里本来就没东西可报 —— 恒真的空转。
+    assert SSL_BENIGN in text
+    assert not any(k in text for k in DEATH_MARKERS)
+
+    # 老行为不变：默认（= 正在查失败）时它是仅有线索，必须报。
+    assert fatal_lines(text) == [SSL_BENIGN]
+
+    # 闸生效：库启动成功 → 不报嫌疑人。
+    assert fatal_lines_for_run(text, lib_ok=True) == []
+
+    # 反向：库真没起来时，这条 ERROR 仍是仅有线索，不许被闸掉。
+    assert fatal_lines_for_run(text, lib_ok=False) == [SSL_BENIGN]
+
+
+def test_the_gate_does_not_mute_real_death_markers():
+    """闸只挡嫌疑人，不挡真凶 —— 哪怕库这次起来了，真凶也要报。
+
+    ★ 这条防的是"修过头"：把 lib_ok=True 当成"什么都可以不报"，于是真正的
+      FATAL 行被一起静音。那样换来的"注解干净"是假的，代价是下一次真崩溃
+      时注解区一片安静 —— 比偶发红字危险得多。
+    """
+    text = _crash_text()
+    assert any(k in text for k in DEATH_MARKERS), "样本里没有真凶，这条测不到东西"
+
+    out = fatal_lines_for_run(text, lib_ok=True)
+
+    assert any(FATAL_SANDBOX in ln for ln in out), "真凶被闸掉了 —— 修过头了"
+    assert any(SIGNAL_6 in ln for ln in out)
+
+
+def test_include_suspects_defaults_to_the_old_behaviour():
+    """默认值必须等于老行为。
+
+    ★ 另外三个调用点（_sandbox_matrix / _forensics / 沙箱矩阵打印）一个字都没改，
+      靠的就是这个默认值 —— 它们全都在"正在查失败"的语境里，报嫌疑人是对的。
+    """
+    for text in (_crash_text(), _health_run_text() + "\n" + SSL_BENIGN, ""):
+        assert fatal_lines(text) == fatal_lines(text, include_suspects=True)
+
+
+def test_the_probe_main_path_does_not_call_the_ungated_entry():
+    """主路径不许绕回无闸的 `fatal_lines(log_text)`。
+
+    ★ 这是一条**结构**断言，不是行为断言 —— 我得把它的射程说清楚：
+      它证明的是"源码里没有那个写错的调用形态"，**不是**"闸真的生效了"。
+      闸本身的行为由上面两条测试覆盖；而【调用点】离线测不到，
+      因为探针主路径要真浏览器 + 真库（本项目里 `needs_browser` 那一档）。
+      与其假装覆盖了，不如把能钉的那半钉住，并写明剩下一半没有守卫。
+
+    ★ 为什么值得钉：这个 bug 的载体是**调用点**而不是函数 —— 函数一直是对的
+      （"没有真凶时才报嫌疑人"），错的是"在健康运行里也问它要嫌疑人"。
+      将来有人在失败路径上写 `fatal_lines(log_text)`，这条会拦下来，
+      并把他推向 `fatal_lines_for_run(log_text, lib_ok=False)` —— 语义等价，
+      但把"这次死了没有"显式写出来了，读的人不用再去猜。
+    """
+    from pathlib import Path
+
+    import devtools.probe_browser as probe_browser
+
+    src = Path(probe_browser.__file__).read_text(encoding="utf-8")
+    assert "fatal_lines(log_text)" not in src, (
+        "探针主路径又绕回了无闸的 fatal_lines(log_text) —— "
+        "健康运行时它会把良性 ERROR 报成「Chrome 的死因行」。"
+        "改用 fatal_lines_for_run(log_text, lib_ok=...)。"
+    )
+    # ★ 反向：确认这个断言不是在空转 —— 主路径确实调用了带闸的那个入口。
+    assert "fatal_lines_for_run(log_text" in src, (
+        "源码里找不到带闸的调用，这条测试是在对着空气断言"
+    )
 
 
 # ── 去重与顺序 ────────────────────────────────────────────────
