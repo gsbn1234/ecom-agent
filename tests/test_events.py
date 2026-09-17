@@ -587,6 +587,55 @@ def test_replay_run_completed_says_how_many_attempts_were_used(tmp_path: Path):
     )
 
 
+def test_replay_run_completed_carries_the_observed_login_state(tmp_path: Path):
+    """★★ 回放的 `run_completed` 必须带**实测**登录态 —— 否则看板的回放视图
+    会把"这次其实是被登录页挡下的"渲染成一次平平无奇的 `completed / empty / 0 行`。
+
+    ★ 为什么这一条比前面几条（`finished_at` / `attempts`）更要紧：
+      那几条丢的是一行字，这一条丢的是一个**结论**。零行 run 的两个成因
+      （店里真没数据 / 登录态失效）在产物里本来长得一模一样，
+      `login_state` 是唯一能分开它们的字段 —— 而回放通道恰好是**看历史**的那条，
+      也就是人最可能去翻"上次为什么是零行"的地方。它在回放里丢掉最讽刺。
+
+    ★ 断言写成**与 run.json 里的值相等**，理由同前：`"login_state" in data`
+      在一个恒发 `""` 的实现上也通过，而那正好是 UI 退回"什么线索都没有"的形态。
+    """
+    record = {
+        "run_id": "r1",
+        "started_at": "2026-09-17T00:00:00+00:00",
+        "finished_at": "2026-09-17T00:00:12+00:00",
+        "login_state": "login_page",
+        "login_state_reason": "URL 命中登录页特征：/login",
+    }
+    _write_run(tmp_path / "r1", steps=[{"step": 1}], record=record)
+    last = events_from_run_dir(tmp_path / "r1")[-1]
+    assert last.type == "run_completed"
+    assert last.data["login_state"] == "login_page", (
+        f"回放载荷里的登录态是 {last.data.get('login_state')!r}，而 run.json 里写的是 login_page"
+    )
+    assert last.data["login_state_reason"] == "URL 命中登录页特征：/login"
+
+
+def test_replay_of_a_run_that_never_probed_says_so_instead_of_guessing(tmp_path: Path):
+    """★ 对照：**Phase 6 之前**的 run.json 里根本没有 `login_state` 这两个键。
+
+    它们必须回放成 `""`（=【没探过】），而不是被填成某个看起来正常的判决。
+    ⚠️ 具体说：**不能**退化成 `"logged_in"`。反了的话，看板会给一批
+    "登录态失效、而当时根本没人知道"的历史 run 盖上"已登录"的章，
+    而这正好让人**不去**看那几张截图 —— 比不显示还坏。
+
+    ★ 手法还是本项目的老手法：先钉空值本身，再钉这个空值**不等于**任何一个真判决。
+      只断言前者的话，一个"缺键就填 logged_in"的实现照样通过 —— 它也有键、也有值。
+    """
+    _write_run(tmp_path / "r1", steps=[{"step": 1}])  # ← 默认 record 就是老 run.json 的形状
+    last = events_from_run_dir(tmp_path / "r1")[-1]
+    assert last.data["login_state"] == ""
+    assert last.data["login_state_reason"] == ""
+    # ★ 空值必须**区别于**三个真判决：两个能让人立刻采取行动，一个（unknown）要人去看图，
+    #   而 "" 的处置是"这个任务压根不需要登录态、别多想"。
+    assert last.data["login_state"] not in ("logged_in", "login_page", "unknown")
+
+
 def test_replay_of_a_crashed_run_still_produces_a_start(tmp_path: Path):
     """★ run 起了但没写 run.json（进程被杀）时，回放**不能崩**、也不能空手而回。
 

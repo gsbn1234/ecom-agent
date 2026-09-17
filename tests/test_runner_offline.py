@@ -1329,6 +1329,57 @@ def test_probe_failure_does_not_take_the_run_down(tmp_path, pdd, monkeypatch):
     assert runner.login_state.is_login_page is False, "读不到 ≠ 落在登录页 —— 不能倒向那个方向"
 
 
+def test_run_completed_payload_carries_the_login_state(tmp_path, pdd, monkeypatch):
+    """★★ **实时**载荷里的登录态必须是实测值 —— 而且"发了个空值"也要能被抓住。
+
+      ★ 这条测试补的是一个用别的手段补不上的洞。判据 8（`test_mock_pdd_e2e.py`
+        里实时载荷与回放载荷逐字段比）能抓住"某个通道**少发了**一个键"，
+        但抓不住"**发的是空的**"：mock 任务的 `requires_login` 是 false，
+        两个通道发的都是 `""`，逐字段比下来完全一致、绿。
+        如果哪天有人把这里写成常量、或者误用了一个恒为空的字段，
+        判据 8 依然是绿的 —— 而看板上那一栏就永远什么都不说。
+
+      ★ 所以这条**必须**用 `login_page` 这种非空值来断言：喂一个空值进去，
+        一个恒发 `""` 的实现也过得了，那就等于没测。
+
+      ★ 链式断言是刻意的：`_build_record`（探针 → 记录）和载荷（记录 → 事件）
+        在两处分别实现，中间那个 record 就是它们的接口。这里把两段接起来跑，
+        证明的是**整条链**：探到登录页 → 落进 record → 发到实时通道。
+        只测后半段的话，"record 里没值"会被载荷层老老实实地转发成空，
+        两边都对，链是断的。
+    """
+    from ecom_agent.observability.events import EventBus
+
+    recorder = make_recorder(tmp_path)
+    # ★ 带上总线：没有总线时 `_publish` 是静默跳过（这是刻意的），
+    #   于是"载荷对不对"这件事压根无从观测。
+    runner = make_runner(pdd, runs_dir=tmp_path, events=EventBus())
+    _patch_run_once(monkeypatch, _ProbeSession(LOGIN_URL, "请扫码登录"))
+
+    _run_once_with(runner, recorder)
+
+    record = runner._build_record(
+        status="completed",
+        parse_status=ParseStatus.EMPTY.value,
+        structured=None,
+        history=None,
+        stop_reason="",
+        started=0.0,
+        recorder=recorder,
+    )
+    payload = runner._run_completed_payload(record)
+    assert payload["login_state"] == "login_page", (
+        f"实时载荷里的登录态是 {payload.get('login_state')!r}，而这次 run 实测落在登录页上\n"
+        f"  看板那一行读的就是这个字段：空着的时候，它和'店里没数据'一模一样。"
+    )
+    assert payload["login_state_reason"], "依据也要发出去 —— 只说'登录页'不告诉人凭什么"
+    # ★ 载荷里那三个"我这次到底怎么了"的字段必须与 record 同源，
+    #   否则报告（读 record）和看板（读载荷）会对同一次 run 说两套话。
+    assert payload["status"] == record.status == "completed"
+    assert payload["parse_status"] == record.parse_status == "empty"
+    assert payload["rows_collected"] == record.rows_collected == 0
+
+
 # ── H. CLI ────────────────────────────────────────────────
 def test_parse_params_keeps_values_as_strings():
     """★ 值保持字符串，类型转换留给编译器的 `_coerce_params`。

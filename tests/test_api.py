@@ -970,6 +970,62 @@ def test_list_runs_is_truthful_about_incomplete_and_skips_approvals(env):
     assert [x["run_id"] for x in items] == sorted(by_id, reverse=True)
 
 
+def test_list_runs_carries_the_observed_login_state_per_run(env):
+    """★★ 这一条钉的是**列表通道**上的登录态 —— 它是"零行"最常被读到的地方。
+
+    ★ 场景具体是什么：跑一次没登录的采集任务，得到一排
+      `completed / empty · 0 行`。人面对这一排的时候要做两个相反的决定 ——
+      "去重新扫码" 还是 "这店本来就没数据"。**这两个决定在列表的三个字段里
+      长得完全一样**，所以这一列不是锦上添花，它是这一排文字里唯一有信息量的那个。
+
+    ★ 为什么用**两个 run 对照**而不是只断言一个字段存在：
+      只断言"有 login_state 这个键"的话，
+        · 一个对每一行都写死同一个值的实现（比如全填 ""）照样通过；
+        · 而这个字段唯一的作用就是**区分**行与行。
+      所以这里造两个形状不同、且**同一次请求里并排返回**的 run，断言它们不同 ——
+      一个字段能区分两行，才叫它携带了信息。
+
+    ★ 老 run.json（Phase 6 之前）的对照也在这一条里：它没有这两个键，
+      必须回 `""`。⚠️ 退化成 `"logged_in"` 是最坏的一种错 ——
+      看板会给"当时根本没人知道登录态已经失效"的历史 run 盖上"已登录"的章，
+      而这正好让人**不去**看那几张本来能看出问题的截图。
+    """
+    build, tmp = env
+    runs = tmp / "runs"
+    # 落在登录页的那次（就是"零行"两个成因里需要人行动的那一个）
+    (runs / "20260102T000000+0000-bbbbbb").mkdir(parents=True)
+    (runs / "20260102T000000+0000-bbbbbb" / "run.json").write_text(
+        json.dumps({"run_id": "20260102T000000+0000-bbbbbb", "task_id": "t",
+                    "task_name": "被登录页挡下的", "status": "completed",
+                    "parse_status": "empty", "rows_collected": 0, "steps": 2,
+                    "login_state": "login_page",
+                    "login_state_reason": "URL 命中登录页特征：/login"}),
+        encoding="utf-8",
+    )
+    # 老的、没探过登录态的
+    (runs / "20260101T000000+0000-aaaaaa").mkdir()
+    (runs / "20260101T000000+0000-aaaaaa" / "run.json").write_text(
+        json.dumps({"run_id": "20260101T000000+0000-aaaaaa", "task_id": "t",
+                    "task_name": "上古 run", "status": "completed",
+                    "parse_status": "empty", "rows_collected": 0, "steps": 2}),
+        encoding="utf-8",
+    )
+    with TestClient(build()) as client:
+        by_id = {x["run_id"]: x for x in client.get("/api/runs").json()["runs"]}
+    got = by_id["20260102T000000+0000-bbbbbb"]
+    assert got["login_state"] == "login_page", (
+        f"列表里的登录态是 {got.get('login_state')!r}，run.json 里写的是 login_page\n"
+        f"  这一列空着的时候，这一行和不带登录态的零行 run 长得一模一样。"
+    )
+    assert got["login_state_reason"] == "URL 命中登录页特征：/login"
+    # ★ 对照一：老 run.json → ""（不是被填成任何一个真判决）
+    old = by_id["20260101T000000+0000-aaaaaa"]
+    assert old["login_state"] == ""
+    assert old["login_state"] not in ("logged_in", "login_page", "unknown")
+    # ★ 对照二：两行并排，值必须不同 —— 证明这一列真的按 run 走，不是写死的常量。
+    assert got["login_state"] != old["login_state"]
+
+
 def test_get_run_returns_replay_events_and_404s_for_unknown(env):
     """★ `GET /api/runs/{id}` 同时是 SSE 的**兜底**：前端收到 `stream_gap`
     或发现 seq 跳号时就来这里拉全量。所以它返回的事件必须和 SSE 同形状 ——
