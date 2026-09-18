@@ -435,8 +435,10 @@ spike 是**一次性探路**——它回答「这条路能不能走」，跑过�
 - `tests/test_compat.py` 可能照样绿（它只验签名在不在）
 - 只是**护栏静默失效**
 
-所以光有「当年跑通过」不够。七个 spike 的判据已经改写成 8 条 `needs_browser` 测试，
-每次 CI 重跑一遍：`uv run pytest -m needs_browser`（本地 ~114s，8 passed）。
+所以光有「当年跑通过」不够。七个 spike 的判据已经改写成 `needs_browser` 档的测试，
+每次 CI 重跑一遍：`uv run pytest -m needs_browser`
+（写这一段时是 8 条；**这一档后来长到了 17 条** —— 除 spike 判据外还并入了登录态持久化
+等真浏览器用例。当前总数看 README 顶部的「测试现状」，这里是历史叙述，不再跟着改数）。
 
 **和 `test_compat.py` 的分工**（两个正交的哨兵，不是重复）：
 
@@ -1544,7 +1546,7 @@ profile 锁）。以前库的拷贝行为顺带避开了这个问题。`devtools
 | `runtime/browser.py:close_gracefully_and_flush()`（CDP 关 + 兜底） | 事实 3 |
 | `devtools/login_pdd.py` 的**三阶段**流程：人工登录 → **新会话复核** → 才写标记 | 事实 1/3 —— **不复核就不知道登录态到底留没留下** |
 | `runtime/profile.py:check_profile()` 把四种情况分成**四句不同的话** | 事实 1 的失败形态是静默的 → 必须让"没登录"和"配置没开"看起来不一样 |
-| `config.py:USER_DATA_DIR` 默认为**空**（无状态） | 有状态的东西不能做默认值：CI 的 13 条浏览器用例会共用一个 cookie 目录 |
+| `config.py:USER_DATA_DIR` 默认为**空**（无状态） | 有状态的东西不能做默认值：CI 的浏览器用例（写这行时 13 条，现 17 条）会共用一个 cookie 目录 |
 | `tasks/pdd_shop_overview.yaml`：不输入、不点击、不翻页、不重试 | R2 —— 首跑要的是**最小动作集**，把"只读"做成任务本身没有写动作，护栏只作纵深防御 |
 
 ## 守卫：`tests/test_profile_persistence.py`（真浏览器，本地硬门禁）

@@ -14,13 +14,14 @@
 > [`docs/spikes.md`](docs/spikes.md)（探路实测结论 + 逐条判据 + CI 排查全程）、
 > [`docs/guardrail_design.md`](docs/guardrail_design.md)（三层护栏各能挡什么、**挡不住什么**）。
 >
-> 测试现状：**459 条 = 442 条离线（CI 硬门禁）+ 17 条 `needs_browser`（本地硬门禁）**。
-> **ADR/README 定稿那次推送 = [`de1ac57`](https://github.com/gsbn1234/ecom-agent/commit/de1ac57)，
-> CI run [`35233757564`](https://github.com/gsbn1234/ecom-agent/actions/runs/35233757564)
+> 测试现状：**467 条 = 450 条离线（CI 硬门禁）+ 17 条 `needs_browser`（本地硬门禁）**。
+> **最近一次 CI 验证过的推送 = [`35c3962`](https://github.com/gsbn1234/ecom-agent/commit/35c3962)，
+> CI run [`35245503321`](https://github.com/gsbn1234/ecom-agent/actions/runs/35245503321)
 > 两个 job 全绿**，且浏览器 job 是真绿 —— gate 走的是「**测试绿**」那条分支，
 > 不是「环境不可用被放行」那条（两者**颜色完全一样，只有注解分得开**）：
-> （那次 run 的注解原文 —— 所以这里的 394 是**当时**的数，不是现在的）
-> `needs_browser 实际结果：17 passed, 394 deselected ；退出码 0` + `探针结论：环境可用`。
+> `needs_browser 实际结果：17 passed, 450 deselected ；退出码 0` + `探针结论：环境可用`。
+> （更早的 ADR/README 定稿那次 `de1ac57` 是 `17 passed, 394 deselected` ——
+>  **那个 394 是当时的数**，留在这里只为说明这个数会随 commit 变。）
 >
 > ⚠️ 这里**点名 commit，不写"最近一次推送"** —— 后者每推一次就自动过期一次，
 > 而这句话在这之前已经过期过三次了。
@@ -56,8 +57,8 @@ cd ecom-agent
 uv venv && uv pip install -e ".[dev]"
 
 cp .env.example .env      # 填 DEEPSEEK_API_KEY
-uv run pytest -m "not needs_browser"   # 离线 442 条，零 token 零网络，应当全绿
-uv run pytest                          # 全部 459 条（含 17 条真浏览器，会真的开 Chrome）
+uv run pytest -m "not needs_browser"   # 离线 450 条，零 token 零网络，应当全绿
+uv run pytest                          # 全部 467 条（含 17 条真浏览器，会真的开 Chrome）
 ```
 
 > ⚠️ **`uv run pytest` 默认包含 `needs_browser`** —— 想"零 token 零网络"地跑一遍，
@@ -70,6 +71,41 @@ uv run pytest                          # 全部 459 条（含 17 条真浏览器
 ```bash
 uv run python main.py run tasks/books_demo.yaml    # 用公开练手站点，不碰任何真实后台
 ```
+
+### 起 Web 看板（实时滚动 + 网页审批 + 历史回放）
+
+看板要**两个进程**：一个本地 mock 卖家后台，一个 FastAPI 服务。
+
+```bash
+uv run python devtools/mock_pdd/server.py     # 终端 A：mock 站点，固定 8765
+uv run uvicorn webapp.app:app --port 8000     # 终端 B：看板
+```
+
+然后打开 `http://127.0.0.1:8000`。探活：
+
+```bash
+curl -s http://127.0.0.1:8000/api/health
+```
+
+健康检查**分两档**：硬依赖（runs 目录可写、SQLite 可写）挂着就返 **503**；
+软依赖（浏览器可执行、LLM key 已配）不通只降级成 `degraded`，**仍返 200** ——
+因为"没配 LLM key"不该让一个只读回放的看板整个不可用。
+
+> ⚠️ `webapp/app.py` 里**没有** `__main__`，所以 `python webapp/app.py` 起不来 ——
+> 唯一入口是模块级的 `app = create_app()`（`webapp/app.py:756`），
+> 由 uvicorn 按 `webapp.app:app` 导入。**这一步以前全仓库没有写，现在写在这。**
+
+演示**网页审批**（护栏拦停 → 人工点拒绝 → LLM 改道）：
+
+```bash
+uv run python main.py run tasks/mock_shop_write_confirm.yaml --approver web
+```
+
+任务跑到写操作会**停住等你在看板上点**。`--approver` 共五档，日常用这三个：
+`web`（网页审批）、`cli`（终端 Y/n）、`deny`（全自动拒绝，只读任务用这个就够）。
+
+⚠️ **`auto-approve` 只在本地 dev 用** —— 它每次打 `WARNING`，并把该 run 标记成
+`unsafe_auto_approved=true`。它是调试后门，不是正常通道（`guardrails/approver.py:412`）。
 
 ---
 
@@ -142,9 +178,9 @@ uv run python main.py run tasks/books_demo.yaml    # 用公开练手站点，不
 ## 测试分层
 
 ```bash
-uv run pytest -m "not needs_browser"   # 442 条离线：DSL / 护栏 / 脱敏 / 落库 / 报告 / API
+uv run pytest -m "not needs_browser"   # 450 条离线：DSL / 护栏 / 脱敏 / 落库 / 报告 / API
 uv run pytest -m needs_browser         # 17 条：需要真实浏览器，对着本地 mock 站点跑
-uv run pytest                          # 459 条全部 = 442 + 17（默认就包含 needs_browser）
+uv run pytest                          # 467 条全部 = 450 + 17（默认就包含 needs_browser）
 ```
 
 > 分层的主轴不是"快慢"，是**依赖什么**：纯逻辑 → 临时文件 → asyncio → 真浏览器。
