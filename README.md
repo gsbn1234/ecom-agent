@@ -15,11 +15,12 @@
 > [`docs/guardrail_design.md`](docs/guardrail_design.md)（三层护栏各能挡什么、**挡不住什么**）。
 >
 > 测试现状：**467 条 = 450 条离线（CI 硬门禁）+ 17 条 `needs_browser`（本地硬门禁）**。
-> **最近一次 CI 验证过的推送 = [`35c3962`](https://github.com/gsbn1234/ecom-agent/commit/35c3962)，
-> CI run [`35245503321`](https://github.com/gsbn1234/ecom-agent/actions/runs/35245503321)
+> **最近一次 CI 验证过的推送 = [`526ca5b`](https://github.com/gsbn1234/ecom-agent/commit/526ca5b)，
+> CI run [`35302746326`](https://github.com/gsbn1234/ecom-agent/actions/runs/35302746326)
 > 两个 job 全绿**，且浏览器 job 是真绿 —— gate 走的是「**测试绿**」那条分支，
 > 不是「环境不可用被放行」那条（两者**颜色完全一样，只有注解分得开**）：
-> `needs_browser 实际结果：17 passed, 450 deselected ；退出码 0` + `探针结论：环境可用`。
+> `needs_browser 实际结果：17 passed, 450 deselected, 30 warnings in 52.45s ；退出码 0`
+> + `探针结论：环境可用`；注解 **0 error** / 2 warning / 10 notice。
 > （更早的 ADR/README 定稿那次 `de1ac57` 是 `17 passed, 394 deselected` ——
 >  **那个 394 是当时的数**，留在这里只为说明这个数会随 commit 变。）
 >
