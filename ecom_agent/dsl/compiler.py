@@ -10,11 +10,20 @@
     | params          | pydantic + 本模块的 _coerce_params          |
     | guardrails      | GuardrailPolicy（运行期拦截）               |
     | output_model    | pydantic（校验 LLM 产出）                   |
-    | pagination      | 计数器（max_pages 是硬闸）                  |
+    | pagination      | ⚠️ **没有强制点** —— 只进 task_text 当句子                  |
     | max_steps       | browser-use 自己的步数上限                  |
 
   而一段自然语言 prompt 的所有约束都只有【一个】强制点：LLM 愿不愿意听。
   DSL 的本质是把「希望 LLM 做的事」和「不管 LLM 做什么都必须成立的事」分离开。
+
+★ `pagination` 那一行是 2026-09-18 改的，改之前写的是「计数器（max_pages 是硬闸）」。
+  那不是"写漏了"，是**写反了**：`CompiledTask` 里根本没有 `pagination` 字段
+  （见下面的字段表），`max_pages` 唯一的去处是第 200 行那句拼进 `task_text` 的话。
+  实测证据：`mock_shop_readonly.yaml` 写 `max_pages: 1`，
+  run `20260918T034157+0000-c9413c` 照样翻到了第 2 页。
+
+  ⚠️ 这一行原样抄进了 `docs/ADR.md` 的 ADR 3 —— **一处写反的话，抄它的地方
+  会各自变成一处新的漂移**，所以那处也一并改了。
 """
 from __future__ import annotations
 

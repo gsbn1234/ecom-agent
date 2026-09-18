@@ -63,7 +63,19 @@ class PaginationSpec(BaseModel):
     mode: Literal["none", "click_next", "scroll"] = "none"
     max_pages: int = Field(default=1, ge=1, le=50)
     """★ 上限防"翻页地狱"：LLM 在翻页类任务上极容易一直翻下去，
-      每翻一页烧一次 token。这是个硬闸，不是建议。"""
+      每翻一页烧一次 token。
+
+    ⚠️ **它是软闸门，不是硬闸** —— 这个字段唯一的去处是编译进 `task_text`
+      （`compiler.py:200` 那句"最多翻 N 页"），运行期**没有任何计数器读它**。
+      实测：`mock_shop_readonly.yaml` 写 `max_pages: 1`，
+      run `20260918T034157+0000-c9413c` 照样翻到了第 2 页。
+
+    ★ 不做成硬闸是一个**决定**，不是遗漏：它防的是**成本**，不是**安全**；
+      而"翻了一页"在三种 mode 下没有统一定义（`click_next` 点按钮 / `scroll`
+      滚动触发 / `none` 不翻），真站点上访问详情页同样会让 URL 变化 ——
+      按 URL 计数会**误停**。**一个数不准的硬闸比一句诚实的话更危险**：
+      它会让人以为这里有保护。兜底是 `agent.max_steps`（browser-use 强制）
+      和 `stop_when` 的"翻到空页就停"。完整取舍见 ADR 3。"""
 
     next_selector_hint: str = ""
     """★ 语义提示，不是 CSS 选择器。

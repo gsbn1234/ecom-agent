@@ -70,7 +70,18 @@ browser-use，而且是一个人写。
 
 **为什么**：**DSL 的本质是把"希望 LLM 做的事"和"不管 LLM 做什么都必须成立的事"分开**。
 每个字段有**独立**的强制点：`params` 由 pydantic 强制、`guardrails` 由 interceptor 强制、
-`output_model` 由 pydantic 强制、`pagination.max_pages` 由计数器强制。
+`output_model` 由 pydantic 强制、`max_steps`／`max_failures` 由 browser-use 自己强制。
+
+⚠️ **这一段的第四项原先是 `pagination.max_pages`，2026-09-18 删掉了** ——
+因为它不是强制点，是**反例**。`max_pages` 唯一的去处是编译成 `task_text` 里的一句
+"最多翻 N 页"（`compiler.py:200`），运行期没有任何计数器读它；`CompiledTask`
+（`compiler.py:39-57`）里**根本没有 `pagination` 这个字段**。
+实测：`mock_shop_readonly.yaml` 写 `max_pages: 1`，run
+`20260918T034157+0000-c9413c` 照样翻到了第 2 页。
+
+留着它比删掉更糟：**一个假例证会把整段论点的可信度一起拉下水** ——
+面试官只要问一句"给我看看那个计数器"，听到的就不是"这一个字段没做到"，
+而是"这四个里到底还有几个是真的"。剩下三项都经得起查。
 而一段自然语言提示词里，所有约束只有**一个**强制点：LLM 愿不愿意听。
 
 **代价与被否掉的选项**：
@@ -81,6 +92,11 @@ browser-use，而且是一个人写。
   那是读错了。
 - 被否掉的选项是"把 prompt 挪进 YAML 就算完"。那只是可维护性，不是强制力 ——
   差别在面试里值得专门讲一遍。
+- ⚠️ **明确不做 `max_pages` 硬闸**（这是决定，不是遗漏）。它防的是**成本**不是**安全**；
+  而"翻了一页"在三种 `mode` 下没有统一定义（`click_next` 点按钮 / `scroll` 滚动触发 /
+  `none` 不翻），真站点上访问详情页同样会让 URL 变化 —— 按 URL 计数会**误停**。
+  **一个数不准的硬闸比一句诚实的话更危险**：它会让人以为这里有保护。
+  兜底是 `agent.max_steps`（browser-use 强制）和 `stop_when` 的"翻到空页就停"。
 
 **证据在哪**：`ecom_agent/dsl/compiler.py`（产物表与 `compile_task`）；
 `devtools/show_compiled.py`（把编译产物直接打出来看，不用跑浏览器）；

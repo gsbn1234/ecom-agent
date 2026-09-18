@@ -8,7 +8,7 @@
 > ✅ **Phase 0–7 全部写完**（骨架 / DSL + 护栏策略 / 真浏览器探路 / 可观测与落库 /
 > mock 站点 e2e + CI / Web 看板 / 真站点首跑 / README + ADR 定稿）。
 > Phase 7 的「护栏实战」改了口径：用**可重跑**的 mock e2e 证据，不对真站点做写操作；
-> **没做到的部分单列在文末**（不是藏起来，是有边界 —— 六条，条条可核对）。
+> **没做到的部分单列在文末**（不是藏起来，是有边界 —— 七条，条条可核对）。
 >
 > 文档：[`docs/ADR.md`](docs/ADR.md)（**16 条架构决策，面试主战场**）、
 > [`docs/spikes.md`](docs/spikes.md)（探路实测结论 + 逐条判据 + CI 排查全程）、
@@ -246,7 +246,7 @@ FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc:129] No usable sandb
 
 按重要程度排。全部可核对 —— 每一条都能顺着指到具体 run、具体文件、具体测试名。
 写在这里的理由是：**主动说清边界，比被问出来强**；而且这一节里没有一条是"想出来的"
-—— 第 1 条是真跑出来的、第 2 条是补上一条缺口时顶出来的、第 4 条是彩排时撞上的。
+—— 第 1 条是真跑出来的、第 2 条是补上一条缺口时顶出来的、第 4 条是彩排时撞上的、第 7 条是把四次 run 的账本摆在一起比出来的。
 
 **1. 没在真站点采到"这个店铺自己的商品"**
 
@@ -364,7 +364,33 @@ FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc:129] No usable sandb
 商品**，且那一页本来就没有商品ID/库存/状态。硬塞进去，会让"这个店有多少商品"
 从此答错。取舍过程见 [ADR 16](docs/ADR.md)。
 
+**7. 每一步的 token 数在每一次真跑里都是 0**
+
+`steps.jsonl` 每行的 `tokens_in`/`tokens_out`、`run.json` 的
+`llm.prompt_tokens`/`completion_tokens`，在**所有**跑过的 run 里都是 0：
+
+| run | total_calls | prompt_tokens | library_calls |
+|---|---|---|---|
+| `20260917T050218+0000-4ec444`（`demo.books`） | 7 | 0 | 0 |
+| `20260917T120507+0000-02eff0`（真站点首跑） | 3 | 0 | 0 |
+| `20260918T034157+0000-c9413c`（mock 只读） | 8 | 0 | 0 |
+
+**两个独立的计数器给出同一个答案**，所以这**不是计数器坏了**：调用次数数得准
+（8 次 = 步进 7 + 裁判 1），而 token 恒为 0。两个通道都收不到 usage ——
+`runtime/llm.py` 的 `_absorb_tokens` 在 `result.usage is None` 时直接返回，
+而库自己的账本 `library_calls` 也是 0（它同样"每次拿到 usage 才记一条"）。
+`runtime/llm.py:104-106` 把这写成了"某些 provider 在失败或流式场景下就是不返回
+usage，那不是错误" —— 但在 DeepSeek 这条路上它**不是边缘情况，是每一次**。
+
+⚠️ **离线测试盖不到它**：`tests/test_runner_offline.py:546` 的桩**自己喂了**
+`prompt_tokens`/`completion_tokens`，所以那条用例是绿的。
+**桩的边界就是覆盖的边界** —— 这个教训本项目已经吃过一次（探针兜底档那次）。
+
+**暂时只登记、不修**：根因在库侧（`ChatDeepSeek` 的适配没把 usage 填进
+`ChatInvokeCompletion`），而**库源码只读**是红线，要修得在我们的 `CountingLLM`
+里另找来源。在那之前，这个字段**不能当作成本依据**。
+
 ---
 
-上面六条不是"还没写完"，是"**知道边界在哪**"。区别在于：前者是进度问题，
+上面七条不是"还没写完"，是"**知道边界在哪**"。区别在于：前者是进度问题，
 后者是可核对的**事实**——每一条都指得出证据在哪，也说得清为什么现在的处置是它。
